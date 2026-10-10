@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#f5f3ee">
+  <title>Claude 额度台</title>
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/style.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <aside class="sidebar">
+    <a href="/" class="brand"><span class="brandmark">C<span>·</span></span><span>额度台<small>CLAUDE MONITOR</small></span></a>
+    <div class="sidebar-label">工作空间</div>
+    <a class="nav-item selected" href="#overview"><span class="nav-icon">▤</span>账号总览<span class="nav-count" id="nav-count">—</span></a>
+    <a class="nav-item" href="#resets"><span class="nav-icon">◷</span>重置时间</a>
+    <button class="nav-item" id="help-open"><span class="nav-icon">ⓘ</span>数据说明</button>
+    <div class="sidebar-bottom"><span class="server-dot"></span>本地额度台<small><span id="server-address">—</span><em>数据保存在此服务器</em></small></div>
+  </aside>
+  <main id="overview">
+    <header class="topbar"><span class="breadcrumb">工作空间 <span>/</span> 账号总览</span><span class="connection" id="connection"><i></i>连接中</span></header>
+    <section class="page-heading">
+      <div><div class="eyebrow">CAPACITY, AT A GLANCE</div><h1>每个账号，心中有数<span>。</span></h1><p>查看剩余额度，安排下一轮工作。</p></div>
+      <div class="heading-actions"><button class="button secondary" id="privacy-toggle" aria-pressed="false">显示邮箱</button><button class="button secondary" id="query-cards-all">查询重置卡</button><button class="button primary" id="refresh-all"><span class="refresh-icon">↻</span>刷新额度</button></div>
+    </section>
+    <div class="error-banner" id="error-banner" role="alert" hidden></div>
+    <section class="summary-grid" aria-label="账号汇总">
+      <div class="summary"><span>已登录账号</span><strong id="summary-login">—</strong><small id="summary-total">正在读取账号列表</small></div>
+      <div class="summary"><span>当前可用账号</span><strong id="summary-available">—</strong><small id="summary-available-note">正在核验额度</small></div>
+      <div class="summary"><span>额度已达上限</span><strong class="orange" id="summary-limited">—</strong><small>按最近记录，重置后待确认</small></div>
+      <div class="summary card-summary"><span>可使用的重置次数 <b>官方查询</b></span><strong id="summary-cards">—</strong><small id="summary-cards-note">点击“查询重置卡”核对</small></div>
+    </section>
+    <div class="mode-note" role="status"><span class="mode-icon">◷</span><div><b id="availability-title">正在核验可用账号</b><span id="availability-detail">额度未知不等于额度耗尽。</span></div></div>
+    <div class="mode-note"><span class="mode-icon">⇄</span><div><b>先统一查询，随后跟随状态栏</b><span id="sync-note">网页每 5 秒读取最新记录；闲置账号不反复查询。</span></div><span id="local-clock" class="local-clock"></span></div>
+    <section class="account-section" aria-label="账号额度">
+      <div class="section-toolbar"><div class="section-title"><h2>账号额度</h2><span id="visible-count"></span></div><div class="filters"><label class="search-wrap"><span>⌕</span><input id="search" type="search" placeholder="搜索账号或邮箱" aria-label="搜索账号或邮箱"></label><select id="filter" aria-label="筛选账号"><option value="all">全部账号</option><option value="live">状态栏跟随</option><option value="limited">额度达上限</option><option value="cards">有重置卡</option><option value="logged_out">未登录</option></select></div></div>
+      <div class="account-grid" id="accounts"><div class="loading-card">正在连接服务器，读取账号额度…</div></div>
+      <div class="empty-state" id="empty" hidden>没有符合条件的账号。<button id="clear-filters">清除筛选</button></div>
+    </section>
+    <section id="resets" class="reset-section"><div class="section-toolbar"><div class="section-title"><h2>接下来重置</h2><span>按最近记录</span></div><span id="timezone" class="timezone"></span></div><div id="reset-list" class="reset-list"><div class="loading-card">等待额度数据</div></div></section>
+    <footer><span><i class="server-dot"></i>仅本地账号 · 官方 Claude 数据</span><span>重置卡仅在确认后使用</span></footer>
+  </main>
+  <dialog id="reset-dialog" aria-labelledby="reset-title">
+    <div class="dialog-heading"><div><div class="eyebrow">LIMIT RESET</div><h2 id="reset-title">查询与使用重置卡</h2></div><button class="icon-button" data-close aria-label="关闭">×</button></div>
+    <p class="dialog-account" id="reset-account"></p>
+    <p class="dialog-note">这里查询官方卡片余额。使用会消耗 1 次重置机会；提交前还会核对账号和卡片。</p>
+    <div id="reset-inventory"></div>
+    <p class="form-error" id="reset-message" role="status"></p>
+    <div class="dialog-actions reset-actions"><button class="edit-card" id="manual-card">手动备注</button><button class="button secondary" data-close>关闭</button><button class="button primary" id="query-card">重新查询</button></div>
+  </dialog>
+  <dialog id="confirm-reset-dialog" aria-labelledby="confirm-reset-title">
+    <div class="dialog-heading"><div><div class="eyebrow">CONFIRM RESET</div><h2 id="confirm-reset-title">确认使用重置卡</h2></div><button class="icon-button" data-close aria-label="关闭">×</button></div>
+    <div id="confirm-reset-details"></div>
+    <p class="dialog-note">确认后会消耗这张卡的 1 次重置机会，无法撤销。周额度的原定重置日保持不变。</p>
+    <p class="form-error" id="confirm-reset-message" role="status"></p>
+    <div class="dialog-actions"><button class="button secondary" data-close>取消</button><button class="button primary" id="confirm-use-card">确认消耗 1 次</button></div>
+  </dialog>
+  <dialog id="card-dialog">
+    <form id="card-form"><div class="dialog-heading"><div><div class="eyebrow">LIMIT RESET</div><h2>记录重置卡</h2></div><button type="button" class="icon-button" data-close aria-label="关闭">×</button></div>
+      <p class="dialog-account" id="card-account"></p>
+      <p class="dialog-note">先在此账号的 <a href="https://claude.ai/settings/usage" target="_blank" rel="noopener noreferrer">Claude 用量页面 ↗</a>核对，再记录结果。这里仅保存备注，不会使用重置卡。</p>
+      <input type="hidden" id="card-profile">
+      <label>核验结果<select id="card-status"><option value="unknown">未核验</option><option value="available">有可用重置卡</option><option value="none">已核验，没有卡</option><option value="used">已使用</option></select></label>
+      <div class="form-grid"><label>卡片适用范围<select id="card-scope"><option value="unknown">尚不清楚</option><option value="five_hour">5 小时额度</option><option value="seven_day">7 天额度</option><option value="both">5 小时和 7 天</option></select></label><label>到期时间（本地时间）<input id="card-expiry" type="datetime-local"></label></div>
+      <label>备注（可选）<textarea id="card-note" maxlength="300" rows="2" placeholder="例如：网页显示的卡片名称或说明"></textarea></label>
+      <div class="form-error" id="card-error" role="alert"></div><div class="dialog-actions"><button type="button" class="button secondary" data-close>取消</button><button type="submit" class="button primary" id="save-card">保存核验结果</button></div>
+    </form>
+  </dialog>
+  <dialog id="help-dialog"><div class="dialog-heading"><div><div class="eyebrow">ABOUT THE DATA</div><h2>这些数据从哪里来</h2></div><button class="icon-button" data-close aria-label="关闭">×</button></div><div class="help-content">
+    <h3>额度与重置时间</h3><p>监控首次启动时，通过官方 Claude Code 的 /usage 查询全部账号一次。之后只读取 claude-auto 状态栏输出的 5h、7d 字段，不定时查询闲置账号，重启服务也会保留已有记录。新增加的账号位置会查询一次；“刷新全部”或账号右上角的刷新按钮可再次查询。</p>
+    <p>状态栏数据通常在模型响应后更新；没有活动时保留上次记录。网页每 5 秒读取本地记录。额度百分比并不是固定的 token 数。/usage 的百分比、重置时间使用官方界面的显示精度，时间约到分钟；状态栏时间可精确到秒。</p>
+    <h3>为什么显示“待确认”</h3><p>重置时间到了，但还没有收到新额度时，不会猜测已恢复为 100%。其他设备或 Claude 网页上的使用也可能使旧记录滞后，需要时可手动刷新。</p>
+    <p>一次查询只返回部分额度时，保留未返回窗口的最近记录并显示提示。会话收到的官方限额错误也会显示到预计恢复时间；当前有窗口运行不代表账号仍有额度。首页分别统计可用、达上限和待确认的账号。</p>
+    <h3>重置卡</h3><p>“查询重置卡”使用当前账号的官方登录查询卡片余额、适用范围和到期时间，同时更新返回的额度数据。页面标明查询时间，超过 5 分钟需重新查询；登录失效或接口异常表示“待确认”，不等于没有卡。停用账号会跳过。</p>
+    <p>“使用重置卡”先刷新卡片信息，并显示要使用的账号与邮箱。只有点击“确认消耗 1 次”才提交。提交结果不明确时不会重复使用；请先查询状态。手动备注仅供参考，不能作为使用依据。刷新网页不会自动使用或反复查询卡片。</p>
+    <a href="https://support.claude.com/en/articles/17007452-what-is-a-limit-reset" target="_blank" rel="noopener noreferrer">阅读官方重置卡说明 ↗</a>
+  </div></dialog>
+  <div id="toast" class="toast" role="status" hidden></div>
+</body>
+</html>

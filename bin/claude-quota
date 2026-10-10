@@ -1,0 +1,9 @@
+#!/bin/sh
+# SPDX-License-Identifier: Apache-2.0
+set -eu
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+dashboard="$script_dir/../share/claude-quota-monitor/monitor.py"
+if [ ! -f "$dashboard" ]; then
+    dashboard="$script_dir/../dashboard/monitor.py"
+fi
+exec python3 "$dashboard" --adapter "$script_dir/claude-accounts" "$@"

@@ -1,0 +1,2081 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+"""Local Claude Code account launcher. Python standard library; Linux only.
+
+Uses official CLAUDE_CONFIG_DIR, auth login/status, hooks and --resume.
+Never reads, copies, edits or exports .credentials.json.
+"""
+from __future__ import annotations
+
+import argparse
+import contextlib
+import datetime
+import errno
+import hashlib
+import json
+import math
+import os
+from pathlib import Path
+import re
+import select
+import shlex
+import shutil
+import signal
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+import uuid
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+ROOT = Path(os.environ.get("CLAUDE_ACCOUNTS_HOME", str(Path.home() / ".claude-accounts")))
+SCRIPT = Path(__file__).resolve()
+VERSION = "2026-10-09.2"
+DISABLED_UNTIL = 253402300799
+SHARED = ("settings.json", "settings.local.json", "CLAUDE.md", "projects", "agents",
+          "commands", "rules", "skills", "plugins", "output-styles", "keybindings.json")
+NAME = re.compile(r"[a-zA-Z][a-zA-Z0-9_-]{0,31}\Z")
+AUTH_ENV = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN",
+            "ANTHROPIC_PROFILE", "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX",
+            "CLAUDE_CODE_USE_FOUNDRY")
+CONTINUE = "继续刚才因账号额度耗尽而中断的任务。先确认已经完成的步骤，避免重复执行已完成的操作。"
+LOGIN_RETRY_DELAYS = (60, 120)
+LOGIN_RETRY_PROMPT = "继续上一条自动恢复请求。先核对已完成的步骤和工具结果，按原会话及原子代理 ID 续接，避免重复执行。"
+LOGIN_PROMPT_RETRY = "继续上一条因登录刷新冲突而未能执行的请求。先核对已完成的步骤和工具结果，保留当前会话和原子代理 ID，避免重复执行。"
+LIFECYCLE = ("SessionStart", "SessionEnd", "UserPromptSubmit", "SubagentStart", "SubagentStop", "Stop",
+             "StopFailure", "PreToolUse", "PostToolUse", "PostToolUseFailure")
+
+
+class ContextNotReady(RuntimeError):
+    """Keep the existing process when a complete checkpoint cannot be verified."""
+
+
+def say(message):
+    print("[claude-accounts] " + message, file=sys.stderr, flush=True)
+
+
+def private_dir(path):
+    path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if path.is_symlink():
+        raise RuntimeError(f"Refusing symlink for private state directory: {path}")
+    path.chmod(0o700)
+
+
+def read_json(path, default=None):
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return default
+
+
+def write_json(path, value):
+    private_dir(path.parent)
+    fd, temporary = tempfile.mkstemp(prefix=".write-", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            json.dump(value, stream, ensure_ascii=False, indent=2)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+        sync_directory(path.parent)
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(temporary)
+
+
+def sync_directory(path):
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+@contextlib.contextmanager
+def state_lock(path):
+    """Lock only a short state-file update, never a running Claude session."""
+    import fcntl
+    private_dir(path.parent)
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    with os.fdopen(fd, "a+") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        yield
+
+
+def load_registry():
+    registry = read_json(ROOT / "accounts.json")
+    if not registry or registry.get("version") != 1:
+        raise RuntimeError("尚未初始化；先运行 claude-accounts init。")
+    for name, directory in registry["profiles"].items():
+        if not NAME.fullmatch(name) or not Path(directory).is_absolute():
+            raise RuntimeError("Invalid profile registry")
+    if not Path(registry["claude"]).is_file():
+        raise RuntimeError("找不到配置中的官方 Claude Code 可执行文件。")
+    return registry
+
+
+def disabled_reason(registry, name):
+    # Long-lived launchers must observe an account disabled in another window.
+    latest = read_json(ROOT / "accounts.json", registry)
+    entry = latest.get("disabled", {}).get(name)
+    if entry:
+        return entry.get("reason", "账号已停用") if isinstance(entry, dict) else str(entry)
+    return None
+
+
+def set_profile_disabled(name, reason=None, source="user"):
+    with state_lock(ROOT / "state/registry.lock"):
+        registry = load_registry()
+        if name not in registry["profiles"]:
+            raise RuntimeError(f"未配置账号：{name}")
+        if reason is not None:
+            registry.setdefault("disabled", {})[name] = {
+                "reason": reason, "source": source, "at": time.time()}
+            # The old launcher also reads this cache before selecting a successor.
+            record_quota(ROOT / "state", name, DISABLED_UNTIL)
+            if registry.get("default") == name:
+                registry["default"] = next((n for n in registry["profiles"]
+                                             if n not in registry["disabled"]), name)
+        else:
+            registry.setdefault("disabled", {}).pop(name, None)
+            with state_lock(ROOT / "state/quota-locks" / (name + ".lock")):
+                path = ROOT / "state/quotas" / (name + ".json")
+                if read_json(path, {}).get("blocked_until") == DISABLED_UNTIL:
+                    path.unlink()
+                    sync_directory(path.parent)
+        write_json(ROOT / "accounts.json", registry)
+
+
+def add_profile(registry, name):
+    if not NAME.fullmatch(name) or name == "state":
+        raise RuntimeError("账号名称只能使用英文字母、数字、下划线和短横线。")
+    if name in registry["profiles"]:
+        return Path(registry["profiles"][name])
+    target = ROOT / name
+    if target.exists():
+        raise RuntimeError(f"目录已存在且未注册，不会覆盖：{target}")
+    private_dir(target)
+    base = Path(registry["profiles"]["main"])
+    (base / "projects").mkdir(exist_ok=True)
+    for item in SHARED:
+        source = base / item
+        if source.exists():
+            (target / item).symlink_to(source, target_is_directory=source.is_dir())
+    registry["profiles"][name] = str(target)
+    write_json(ROOT / "accounts.json", registry)
+    return target
+
+
+def init():
+    private_dir(ROOT)
+    if (ROOT / "accounts.json").exists():
+        return load_registry()
+    binary = Path.home() / ".local/bin/claude"
+    if not binary.is_file():
+        found = shutil.which("claude")
+        if not found:
+            raise RuntimeError("请先安装官方 Claude Code。")
+        binary = Path(found)
+    base = Path.home() / ".claude"
+    base.mkdir(mode=0o700, exist_ok=True)
+    registry = {"version": 1, "claude": str(binary),
+                "profiles": {"main": str(base)}, "default": "main"}
+    write_json(ROOT / "accounts.json", registry)
+    add_profile(registry, "second")
+    return registry
+
+
+def profile_env(registry, name):
+    if name not in registry["profiles"]:
+        raise RuntimeError(f"未配置账号：{name}")
+    if reason := disabled_reason(registry, name):
+        raise RuntimeError(f"账号 {name} 已停用：{reason}")
+    env = os.environ.copy()
+    present = [key for key in AUTH_ENV if env.get(key)]
+    if present:
+        raise RuntimeError("环境变量会覆盖账号登录，请先在当前终端取消设置：" + ", ".join(present))
+    directory = Path(registry["profiles"][name])
+    if directory == Path.home() / ".claude":
+        env.pop("CLAUDE_CONFIG_DIR", None)
+    else:
+        env["CLAUDE_CONFIG_DIR"] = str(directory)
+    # Native 2.1.295 can wait 3 minutes for response headers, then escalate to
+    # 10 minutes on its next attempt. Idle proxy connections reproduced this
+    # stall. Bound the native request wait; the native client owns retries.
+    # Preserve an explicit operator timeout and leave direct connections alone.
+    if any(env.get(key) for key in ("HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY",
+                                    "https_proxy", "http_proxy", "all_proxy")):
+        env.setdefault("API_TIMEOUT_MS", "60000")
+    return env
+
+
+def auth_status(registry, name):
+    if reason := disabled_reason(registry, name):
+        return {"loggedIn": False, "disabled": True, "reason": reason}
+    try:
+        result = subprocess.run([registry["claude"], "auth", "status"],
+                                env=profile_env(registry, name), capture_output=True,
+                                text=True, timeout=20)
+        data = json.loads(result.stdout)
+        if not isinstance(data, dict):
+            return {"loggedIn": False, "error": "InvalidAuthStatus"}
+        return {key: data.get(key) for key in
+                ("loggedIn", "authMethod", "apiProvider", "subscriptionType", "email")}
+    except (subprocess.SubprocessError, json.JSONDecodeError) as exc:
+        return {"loggedIn": False, "error": type(exc).__name__}
+
+
+def eligible(status):
+    return not status.get("disabled") and status.get("loggedIn") is True and status.get("authMethod") == "claude.ai"
+
+
+def account_identity(status):
+    email = status.get("email")
+    return email.strip().casefold() if isinstance(email, str) and email.strip() else None
+
+
+def prepare_profiles(registry, total):
+    """Prepare any requested number of profiles without changing existing ones."""
+    if total < len(registry["profiles"]):
+        raise RuntimeError(f"已配置 {len(registry['profiles'])} 个位置；总数不能更少。补登现有账号可用 login-all。")
+    number = 3 if "second" in registry["profiles"] else 2
+    while len(registry["profiles"]) < total:
+        name = f"account{number:02d}"
+        number += 1
+        if name not in registry["profiles"]:
+            add_profile(registry, name)
+    return list(registry["profiles"])
+
+
+def login_profiles(registry, names, skip_existing=False):
+    """Run official interactive authorization sequentially; keep completed logins."""
+    names = list(dict.fromkeys(names))
+    if any(not NAME.fullmatch(name) or name == "state" for name in names):
+        raise RuntimeError("账号名称须以英文字母开头，长度不超过 32，只能包含字母、数字、下划线和短横线。")
+    for name in names:
+        add_profile(registry, name)
+    statuses = {name: auth_status(registry, name) for name in registry["profiles"]}
+    for index, name in enumerate(names, 1):
+        if reason := disabled_reason(registry, name):
+            say(f"{name} 已停用，跳过登录：{reason}")
+            continue
+        status = statuses[name]
+        identity = account_identity(status)
+        # The first registered position owns an existing identity. Later duplicates
+        # need a different account, so setup never counts them as extra capacity.
+        owner = next((other for other, value in statuses.items()
+                      if identity and eligible(value) and account_identity(value) == identity), None)
+        if skip_existing and status.get("error"):
+            raise RuntimeError(f"读取 {name} 登录状态失败（{status['error']}）；请稍后重试，已完成登录会保留。")
+        if skip_existing and eligible(status) and owner in (None, name):
+            say(f"[{index}/{len(names)}] {name} 已登录，跳过。")
+            continue
+        if skip_existing and eligible(status):
+            say(f"{name} 与 {owner} 是同一账号，请在接下来的官方网页选择另一个账号。")
+        say(f"[{index}/{len(names)}] 登录 {name}；请在官方网页确认账号。Ctrl+C 可停止，完成的登录会保留。")
+        result = subprocess.run([registry["claude"], "auth", "login", "--claudeai"],
+                                env=profile_env(registry, name))
+        if result.returncode != 0:
+            say(f"{name} 登录未完成，已停止。运行 setup 或 login-all 可继续。")
+            return 130 if result.returncode < 0 else result.returncode
+        status = statuses[name] = auth_status(registry, name)
+        if not eligible(status):
+            raise RuntimeError(f"{name} 未确认以订阅方式登录；请重试 claude-accounts login {name}。")
+        identity = account_identity(status)
+        duplicate = next((other for other, value in statuses.items()
+                          if other != name and identity and eligible(value)
+                          and account_identity(value) == identity), None)
+        if duplicate:
+            raise RuntimeError(f"{name} 与 {duplicate} 登录了同一账号；请在网页切换账号后重新运行 setup 或 login {name}。")
+        say(f"{name} 登录完成。")
+    say("本批登录完成。用 claude-accounts status 查看状态，claude-auto 启动自动轮换。")
+    return 0
+
+
+def inherit_preferences(registry, name):
+    """Carry over existing onboarding/trust choices, never identity or credentials."""
+    if Path(registry["profiles"][name]) == Path.home() / ".claude":
+        return
+    with state_lock(ROOT / "state" / "profile-locks" / (name + ".lock")):
+        inherit_preferences_locked(registry, name)
+
+
+def inherit_preferences_locked(registry, name):
+    source = read_json(Path.home() / ".claude.json", {})
+    target = Path(registry["profiles"][name]) / ".claude.json"
+    original = read_json(target, {})
+    value = json.loads(json.dumps(original))
+    for key in ("hasCompletedOnboarding", "lastOnboardingVersion", "lastReleaseNotesSeen",
+                "hasSeenAutoDefaultNotice", "hasSeenAutoModeEntryWarning", "mcpServers"):
+        if key not in value and key in source:
+            value[key] = source[key]
+    trust_keys = ("hasTrustDialogAccepted", "hasCompletedProjectOnboarding",
+                  "hasClaudeMdExternalIncludesApproved", "hasClaudeMdExternalIncludesWarningShown")
+    for project, settings in source.get("projects", {}).items():
+        if not isinstance(settings, dict) or not settings.get("hasTrustDialogAccepted"):
+            continue
+        dst = value.setdefault("projects", {}).setdefault(project, {})
+        for key in trust_keys:
+            if key in settings and key not in dst:
+                dst[key] = settings[key]
+    if value != original:
+        if target.exists():
+            backup = ROOT / "state" / "backups" / (name + "-preferences-" + uuid.uuid4().hex + ".json")
+            write_json(backup, original)
+        write_json(target, value)
+
+
+def append_record(path, value):
+    data = (json.dumps(value, ensure_ascii=False) + "\n").encode("utf-8")
+    fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+    try:
+        view = memoryview(data)
+        while view:
+            written = os.write(fd, view)
+            view = view[written:]
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def session_state_path(run_dir, session_id):
+    uuid.UUID(session_id)
+    return run_dir / "sessions" / (session_id + ".json")
+
+
+def safety_stop(value):
+    text = json.dumps(value, ensure_ascii=False).lower()
+    return account_unavailable(value) or any(word in text for word in ("[cyber]", "safeguard", "usage policy", "account_on_hold"))
+
+
+def account_unavailable(event):
+    # Only explicit service account errors, never arbitrary tool/user text.
+    text = " ".join(str(event.get(k, "")) for k in
+                    ("error", "details", "message", "error_details", "last_assistant_message")).lower()
+    return (event.get("error") in ("account_disabled", "account_banned", "account_suspended", "account_on_hold")
+            or bool(re.search(r"\b(?:your |this )?(?:account|organization) (?:has been |is |was )(?:disabled|banned|suspended)\b", text))
+            or "account_on_hold" in text)
+
+
+def process_identity(pid):
+    try:
+        return (Path("/proc") / str(pid) / "stat").read_text().rsplit(") ", 1)[1].split()[19]
+    except (OSError, IndexError):
+        return None
+
+
+def legacy_session_owners(session_id):
+    owners = []
+    for proc in Path("/proc").iterdir():
+        if not proc.name.isdigit() or int(proc.name) == os.getpid():
+            continue
+        try:
+            if proc.stat().st_uid != os.getuid():
+                continue
+            command = (proc / "cmdline").read_bytes().split(b"\0")
+            if not any(arg.endswith(b"/claude-accounts") for arg in command):
+                continue
+            for fd in (proc / "fd").iterdir():
+                target = fd.resolve()
+                if target.name != "events.jsonl" or not target.is_relative_to(ROOT / "state" / "runs"):
+                    continue
+                if (target.parent / "launch.json").exists():
+                    continue
+                current = None
+                for line in target.read_text().splitlines():
+                    with contextlib.suppress(ValueError):
+                        event = json.loads(line)
+                        if event.get("event") == "SessionStart":
+                            current = event.get("session_id")
+                if current == session_id:
+                    owners.append(int(proc.name))
+        except OSError:
+            continue
+    return owners
+
+
+def claim_session(session_id, owner_pid):
+    uuid.UUID(session_id)
+    identity = process_identity(owner_pid)
+    if not identity:
+        raise ContextNotReady("启动器进程身份无法校验。")
+    lease_path = ROOT / "state" / "session-leases" / (session_id + ".json")
+    with state_lock(lease_path.with_suffix(".lock")):
+        previous = read_json(lease_path, {})
+        other_pid = previous.get("pid")
+        if other_pid and other_pid != owner_pid and process_identity(other_pid) == previous.get("identity"):
+            raise ContextNotReady(f"原会话仍由进程 {other_pid} 打开；请先退出原窗口，未启动第二份会话。")
+        old_owners = [pid for pid in legacy_session_owners(session_id) if pid != owner_pid]
+        if old_owners:
+            raise ContextNotReady(f"原会话仍在旧版窗口中运行（进程 {old_owners[0]}）；请先退出原窗口再恢复。")
+        write_json(lease_path, {"pid": owner_pid, "identity": identity})
+
+
+def reconcile_untracked_hooks(state):
+    """Keep native internal terminal hooks separate from actually started agents."""
+    transcript = Path(state.get("transcript_path", ""))
+    for agent_id, agent in list(state.get("agents", {}).items()):
+        path = Path(agent.get("agent_transcript_path") or
+                    transcript.with_suffix("") / "subagents" / ("agent-" + agent_id + ".jsonl"))
+        if (agent.get("state") in ("stopped", "failed", "blocked")
+                and not agent.get("started_at") and not agent.get("agent_type") and not path.is_file()):
+            state.setdefault("unattributed_events", {})[agent_id] = state["agents"].pop(agent_id)
+
+
+def timestamp_seconds(value):
+    try:
+        return datetime.datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+    except (AttributeError, TypeError, ValueError):
+        return 0
+
+
+def external_watcher(task, cwd):
+    """Recognize only locally configured, hash-pinned, already-running services.
+
+    Never execute a command supplied by a transcript or a model.
+    """
+    if task.get("type") != "shell":
+        return None
+    try:
+        argv = shlex.split(task.get("command", ""))
+    except ValueError:
+        return None
+    for watcher in read_json(ROOT / "persistent-watchers.json", []):
+        expected = watcher.get("argv", [])
+        if len(argv) != len(expected) or len(argv) < 2 or Path(cwd).resolve() != Path(watcher["cwd"]).resolve():
+            continue
+        if (argv[0] not in (expected[0], Path(expected[0]).name) or argv[2:] != expected[2:]
+                or (Path(cwd) / argv[1]).resolve() != Path(expected[1]).resolve()):
+            continue
+        script = Path(expected[1])
+        if not script.is_file() or file_hash(script) != watcher.get("script_sha256"):
+            continue
+        service = watcher.get("service", "")
+        if not re.fullmatch(r"claude-[a-z0-9-]+\.service", service):
+            continue
+        try:
+            check = subprocess.run(["systemctl", "--user", "is-active", "--quiet", service],
+                                   capture_output=True, timeout=2)
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        if check.returncode == 0:
+            return {"service": service, "log": watcher.get("log"), "verified_at": time.time()}
+    return None
+
+
+def watcher_messages(cwd):
+    messages, alerts = [], []
+    for watcher in read_json(ROOT / "persistent-watchers.json", []):
+        if Path(cwd).resolve() != Path(watcher["cwd"]).resolve():
+            continue
+        log = Path(watcher["log"])
+        try:
+            with log.open("rb") as stream:
+                stream.seek(max(0, log.stat().st_size - 8192))
+                tail = stream.read().decode("utf-8", errors="replace")
+        except OSError:
+            tail = ""
+        if "[ALERT]" in tail:
+            alerts.append("模型监视服务已报警，请先读取并核对原日志：" + str(log))
+        else:
+            active = external_watcher({"type": "shell", "command": shlex.join(watcher["argv"])}, cwd)
+            messages.append(("独立模型监视服务正在运行；Claude 退出或切号不会停止它，无需在 Bash 后台重复启动。" if active else
+                             "模型监视服务当前未运行，请检查服务及日志。") +
+                            "服务：" + watcher["service"] + "；日志：" + str(log))
+    return messages, alerts
+
+
+def remember_task_receipt(state, task_id, status, at, source, receipt_id=None):
+    if not isinstance(task_id, str) or not re.fullmatch(r"[a-zA-Z0-9_-]+", task_id) or at <= 0:
+        return
+    receipts = state.setdefault("task_receipts", {})
+    if at >= receipts.get(task_id, {}).get("at", 0):
+        receipts[task_id] = {"status": status, "at": at, "source": source, "uuid": receipt_id}
+
+
+def native_task_result(state, result, at, source):
+    if not isinstance(result, dict) or at <= 0:
+        return
+    task_id = result.get("backgroundTaskId")
+    if isinstance(task_id, str) and re.fullmatch(r"[a-zA-Z0-9_-]+", task_id):
+        starts = state.setdefault("task_starts", {})
+        starts[task_id] = max(at, starts.get(task_id, 0))
+    task_id = result.get("task_id")
+    if (isinstance(task_id, str) and result.get("task_type") == "local_bash"
+            and str(result.get("message", "")).startswith(f"Successfully stopped task: {task_id} (")):
+        remember_task_receipt(state, task_id, "stopped", at, source)
+
+
+def native_task_notification(state, text, at, source, receipt_id=None):
+    if not isinstance(text, str) or not text.lstrip().startswith("<task-notification>"):
+        return
+    task_id = re.search(r"<task-id>([a-zA-Z0-9_-]+)</task-id>", text)
+    status = re.search(r"<status>(completed|failed|stopped|killed)</status>", text)
+    if task_id and status:
+        remember_task_receipt(state, task_id[1], status[1], at, source, receipt_id)
+
+
+def reconcile_receipts(state):
+    """Use persisted native receipts when a completion hook was omitted.
+
+    Incremental offsets keep this cheap for long sessions. Only native user
+    tool_result rows and explicitly tagged task notifications change liveness.
+    """
+    paths = [Path(state.get("transcript_path", ""))]
+    for agent_id, agent in state.get("agents", {}).items():
+        paths.append(Path(agent.get("agent_transcript_path") or
+                          paths[0].with_suffix("") / "subagents" / ("agent-" + agent_id + ".jsonl")))
+    cursors = state.setdefault("receipt_cursors", {})
+    if state.get("receipt_schema") != 2:
+        # Replay old offsets once: prior versions ignored TaskStop and native
+        # queued/attachment notifications already passed by their cursors.
+        cursors.clear()
+        state["receipt_schema"] = 2
+    for path in paths:
+        try:
+            info = path.stat()
+            if not path.is_file():
+                continue
+            cursor = cursors.get(str(path), {})
+            offset = cursor.get("offset", 0) if cursor.get("inode") == info.st_ino else 0
+            if offset > info.st_size:
+                offset = 0
+            with path.open("rb") as stream:
+                stream.seek(offset)
+                while line := stream.readline():
+                    if not line.endswith(b"\n"):
+                        break
+                    offset = stream.tell()
+                    try:
+                        row = json.loads(line)
+                    except ValueError:
+                        continue
+                    if row.get("sessionId") and row["sessionId"] != state.get("session_id"):
+                        continue
+                    at = timestamp_seconds(row.get("timestamp"))
+                    if row.get("type") == "queue-operation" and row.get("operation") == "enqueue":
+                        native_task_notification(state, row.get("content"), at, "native-task-queue", row.get("commandUuid"))
+                    attachment = row.get("attachment") or {}
+                    if (row.get("type") == "attachment" and attachment.get("type") == "queued_command"
+                            and attachment.get("commandMode") == "task-notification"
+                            and (attachment.get("origin") or {}).get("kind") == "task-notification"):
+                        native_task_notification(state, attachment.get("prompt"),
+                                                 timestamp_seconds(attachment.get("timestamp")) or at,
+                                                 "native-task-attachment", row.get("uuid"))
+                    if row.get("type") != "user":
+                        continue
+                    content = row.get("message", {}).get("content", [])
+                    if isinstance(content, str):
+                        content = [{"type": "text", "text": content}]
+                    if any(isinstance(block, dict) and block.get("type") == "tool_result" for block in content):
+                        native_task_result(state, row.get("toolUseResult"), at, "native-tool-result")
+                    for block in content:
+                        if not isinstance(block, dict):
+                            continue
+                        if block.get("type") == "tool_result":
+                            state.get("pending_tools", {}).pop(block.get("tool_use_id"), None)
+                        if (row.get("origin") or {}).get("kind") != "task-notification":
+                            continue
+                        native_task_notification(state, block.get("text", ""), at, "native-task-notification", row.get("uuid"))
+            cursors[str(path)] = {"inode": info.st_ino, "offset": offset}
+        except OSError:
+            continue
+
+
+def reconcile_background(state):
+    reconcile_receipts(state)
+    for task in state.get("background_tasks", []):
+        if task.get("status") not in ("running", "pending", "external"):
+            continue
+        agent = state.get("agents", {}).get(task.get("id"), {})
+        if task.get("type") == "subagent" and agent.get("state") in ("stopped", "failed", "blocked"):
+            task.update(status=agent["state"], reconciled_by="agent-lifecycle")
+            continue
+        receipt = state.get("task_receipts", {}).get(task.get("id"), {})
+        # A compact/resume can repeat a stale running snapshot after completion.
+        # A proven task launch is the boundary, not the snapshot publication time.
+        started = max(state.get("task_starts", {}).get(task.get("id"), 0), agent.get("started_at", 0))
+        boundary = started or state.get("background_tasks_at", 0)
+        if receipt and receipt.get("at", 0) >= boundary:
+            task.update(status=receipt["status"], reconciled_by=receipt.get("source", "native-task-notification"))
+            if task.get("type") == "subagent" and agent.get("state") == "running":
+                agent.update(state="failed" if receipt["status"] == "failed" else "stopped", stopped_at=receipt["at"])
+            continue
+        watcher = external_watcher(task, state.get("cwd", ""))
+        if watcher:
+            task.update(status="external", external=watcher, reconciled_by="verified-user-service")
+        elif task.get("status") == "external":
+            # Service ownership must still be valid at the moment of rotation.
+            task.update(status="running")
+            task.pop("external", None)
+
+
+def lifecycle_record(run_dir, account, payload):
+    """Durable full hook receipts cover the transcript writer's async lag."""
+    sid, kind = payload["session_id"], payload["hook_event_name"]
+    path = session_state_path(run_dir, sid)
+    now = time.time()
+    lease_error = None
+    if kind == "SessionStart" and os.environ.get("CLAUDE_ACCOUNTS_CONTROLLER_PID"):
+        try:
+            claim_session(sid, int(os.environ["CLAUDE_ACCOUNTS_CONTROLLER_PID"]))
+        except ContextNotReady as exc:
+            lease_error = str(exc)
+    with state_lock(run_dir / "lifecycle.lock"):
+        append_record(run_dir / "lifecycle.jsonl", {"at": now, "account": account, "payload": payload})
+        state = read_json(path, {"session_id": sid, "agents": {}, "pending_tools": {}, "scratchpads": []})
+        client_id = os.environ.get("CLAUDE_ACCOUNTS_CLIENT_ID")
+        if kind == "SessionStart":
+            new_client = (state.get("ended_at") or state.get("account", account) != account or
+                          (client_id and state.get("client_id") != client_id))
+            if new_client:
+                # Old native task registries do not survive process exit. Keep
+                # their last snapshot for recovery, not as a live wait condition.
+                state.setdefault("prior_background_tasks", []).extend(state.pop("background_tasks", []))
+                state.pop("background_tasks_at", None)
+            state.pop("ended_at", None)
+            state["account"] = account
+            if client_id:
+                state["client_id"] = client_id
+        state["updated_at"] = now
+        state["hook_version"] = VERSION
+        for field in ("transcript_path",):
+            if payload.get(field):
+                state[field] = payload[field]
+        if payload.get("cwd") and not payload.get("agent_id"):
+            state["cwd"] = payload["cwd"]
+        if payload.get("scratchpad_dir") and payload["scratchpad_dir"] not in state["scratchpads"]:
+            state["scratchpads"].append(payload["scratchpad_dir"])
+        reconcile_untracked_hooks(state)
+        agent_id = payload.get("agent_id")
+        untracked_failure = (agent_id and kind in ("StopFailure", "SubagentStop") and agent_id not in state["agents"]
+                             and not payload.get("agent_type")
+                             and not (Path(state.get("transcript_path", "")).with_suffix("") /
+                                      "subagents" / ("agent-" + agent_id + ".jsonl")).is_file())
+        if untracked_failure:
+            # Native internal requests can carry an agent_id without a spawned
+            # subagent or transcript. Preserve the receipt, not a fictitious task.
+            state.setdefault("unattributed_events", {})[agent_id] = {
+                "event": kind, "error": payload.get("error"), "stopped_at": now}
+        elif agent_id:
+            agent = state["agents"].setdefault(agent_id, {"state": "unknown"})
+            for field in ("agent_type", "agent_transcript_path"):
+                if payload.get(field):
+                    agent[field] = payload[field]
+            if kind == "SubagentStart":
+                agent.update(state="running", started_at=now)
+                agent.pop("error", None)
+            elif kind == "SubagentStop":
+                agent.update(state=agent.get("state", "failed") if agent.get("error") else "stopped", stopped_at=now)
+            elif kind == "StopFailure":
+                agent.update(state="blocked" if safety_stop(payload) else "failed", error=payload.get("error"), stopped_at=now)
+        if isinstance(payload.get("background_tasks"), list):
+            state["background_tasks"] = payload["background_tasks"]
+            state["background_tasks_at"] = now
+        recovery = read_json(run_dir / "pending-recovery.json", {})
+        if lease_error:
+            recovery = {"session_id": sid, "transcript_path": payload.get("transcript_path", ""),
+                        "error": lease_error, "verified": False}
+        reason = None
+        watcher_info, watcher_alerts = watcher_messages(state.get("cwd", "")) if kind in ("PreToolUse", "SessionStart", "UserPromptSubmit") else ([], [])
+        if recovery and kind == "SessionStart" and not lease_error and recovery.get("manifest"):
+            expected_path = Path(recovery["transcript_path"]).resolve()
+            actual_path = Path(payload.get("transcript_path", "")).resolve()
+            recovery["verified"] = sid == recovery["session_id"] and actual_path == expected_path
+            if not recovery["verified"]:
+                recovery["error"] = "恢复的会话 ID 或历史文件不一致；已禁止自动继续。"
+            else:
+                recovery.pop("error", None)
+        if recovery and sid == recovery["session_id"] and kind == "SubagentStart":
+            if agent_id in recovery.get("pending_agents", []):
+                recovery["pending_agents"].remove(agent_id)
+                recovery.setdefault("resumed_agents", []).append(agent_id)
+        if kind == "PreToolUse":
+            draining = read_json(run_dir / "draining.json", {})
+            if draining.get("session_id") == sid:
+                reason = "额度切换正在等待已启动任务结束并保存完整记录；本次新工具调用未执行，请停止并等待恢复。"
+            elif recovery and not recovery.get("verified"):
+                reason = recovery.get("error", "会话恢复尚未通过校验，请停止并报告。")
+            elif recovery and payload.get("tool_name") == "SendMessage" and (payload.get("tool_input") or {}).get("to") in recovery.get("blocked_agents", []):
+                reason = "该子代理因服务安全或账号限制停止，未自动续接；请报告原错误并等待用户处理。"
+            elif watcher_alerts and payload.get("tool_name") not in ("Read", "Glob", "Grep", "AskUserQuestion"):
+                reason = "\n".join(watcher_alerts)
+            elif recovery and not agent_id and recovery.get("pending_agents") and payload.get("tool_name") not in ("Read", "Glob", "Grep", "SendMessage", "TaskOutput", "ToolSearch", "AskUserQuestion"):
+                reason = "请先检查历史并用 SendMessage 续接原子代理 ID；恢复前不开始新修改或新子任务。无法续接时报告并等待用户处理：" + ", ".join(recovery["pending_agents"])
+            elif payload.get("tool_name") == "Bash":
+                watcher = external_watcher({"type": "shell", "command": (payload.get("tool_input") or {}).get("command", "")}, state.get("cwd", ""))
+                if watcher:
+                    reason = "此只读监视脚本已由独立用户服务运行，切号后仍保持运行，无需重复启动。服务：" + watcher["service"] + "；日志：" + str(watcher["log"])
+            if not reason and payload.get("tool_use_id"):
+                state["pending_tools"][payload["tool_use_id"]] = {
+                    "tool_name": payload.get("tool_name"), "agent_id": agent_id}
+        elif kind in ("PostToolUse", "PostToolUseFailure"):
+            state["pending_tools"].pop(payload.get("tool_use_id"), None)
+            if kind == "PostToolUse" and payload.get("tool_name") in ("Bash", "TaskStop"):
+                native_task_result(state, payload.get("tool_response"), now, "native-tool-hook")
+        if kind == "SessionEnd":
+            state["ended_at"] = now
+        reconcile_background(state)
+        write_json(path, state)
+        if recovery:
+            write_json(run_dir / "pending-recovery.json", recovery)
+    if reason:
+        return {"hookSpecificOutput": {"hookEventName": kind,
+                "permissionDecision": "deny", "permissionDecisionReason": reason}}
+    if kind == "UserPromptSubmit" and recovery and not recovery.get("verified"):
+        return {"decision": "block", "reason": recovery.get("error", "上下文恢复尚未通过校验。")}
+    if kind in ("SessionStart", "UserPromptSubmit"):
+        context = watcher_info + watcher_alerts
+        if kind == "SessionStart" and recovery:
+            context.append(recovery.get("error") or recovery_prompt(Path(recovery["manifest"])))
+        if context:
+            return {"hookSpecificOutput": {"hookEventName": kind, "additionalContext": "\n".join(context)}}
+    return None
+
+
+def scratch_directory_exclusion(directory):
+    """Identify rebuildable environments/output; keep their original files intact."""
+    if directory.name in ("node_modules", "__pycache__", ".cache"):
+        return "generated-dependency-or-cache-directory"
+    config = directory / "pyvenv.cfg"
+    if config.is_file() and not config.is_symlink():
+        return "python-virtual-environment"
+    # A directory merely named dist may contain hand-written work. Require the
+    # native bundler's hashed module entry and keep source trees in the archive.
+    if re.fullmatch(r"(?:dist|.*[-_]dist|vite-out-.+)", directory.name):
+        index = directory / "index.html"
+        if index.is_file() and not index.is_symlink() and index.stat().st_size <= 1_000_000:
+            html = index.read_text(encoding="utf-8", errors="replace")
+            if re.search(r'<script\b[^>]*type=["\']module["\'][^>]*src=["\']/assets/[^"\']+-[\w-]{6,}\.js["\']', html):
+                return "generated-vite-build-output"
+    return None
+
+
+def context_sources(registry, state):
+    sid = state["session_id"]
+    uuid.UUID(sid)
+    roots = {(Path(directory) / "projects").resolve() for directory in registry["profiles"].values()}
+    raw = state.get("transcript_path")
+    candidates = [Path(raw).expanduser().resolve()] if raw else [p for root in roots for p in root.glob("*/" + sid + ".jsonl")]
+    if len(candidates) != 1:
+        raise ContextNotReady("不能唯一定位原会话文件；保留原进程。")
+    transcript = candidates[0]
+    if transcript.name != sid + ".jsonl" or not any(transcript.is_relative_to(root) for root in roots):
+        raise ContextNotReady("会话文件不在已配置的共享历史目录内。")
+    if not transcript.is_file() or not transcript.stat().st_size:
+        raise ContextNotReady("原会话记录尚未写入磁盘。")
+    sources = {transcript: "main"}
+    excluded = []
+
+    def add_tree(directory, role):
+        if not directory.exists():
+            return
+        if directory.is_symlink():
+            raise ContextNotReady("上下文目录含符号链接，未自动跟随：" + str(directory))
+        def entries():
+            for current, directories, filenames in os.walk(directory, followlinks=False):
+                for name in list(directories):
+                    child = Path(current) / name
+                    if child.is_symlink():
+                        yield child
+                        directories.remove(name)
+                    elif role == "scratchpad":
+                        reason = "credential-file-not-read" if name == ".credentials.json" else scratch_directory_exclusion(child)
+                        if reason:
+                            excluded.append({"source": str(child), "reason": reason})
+                            directories.remove(name)
+                for name in filenames:
+                    yield Path(current) / name
+
+        for path in entries():
+            if path.name == ".credentials.json" and role == "scratchpad":
+                # Authentication state (including local test profiles) is owned
+                # by its tool, never read/copied or required for chat recovery.
+                excluded.append({"source": str(path), "reason": "credential-file-not-read"})
+                continue
+            if path.is_symlink():
+                if role != "scratchpad":
+                    raise ContextNotReady("上下文文件含符号链接，未自动跟随：" + str(path))
+                # Scratch workspaces link to source/assets. Archive the link text
+                # only, including dangling links; never traverse its target.
+                if path.name == ".credentials.json":
+                    raise ContextNotReady("上下文目录出现凭据文件，未读取。")
+                sources[path] = role
+                continue
+            if path.is_file():
+                if path.name == ".credentials.json":
+                    raise ContextNotReady("上下文目录出现凭据文件，未读取。")
+                sources[path] = role
+
+    add_tree(transcript.with_suffix(""), "session-files")
+    for directory in registry["profiles"].values():
+        add_tree(Path(directory) / "tasks" / sid, "tasks")
+    temp_root = (Path(tempfile.gettempdir()) / ("claude-" + str(os.getuid()))).resolve()
+    for directory in state.get("scratchpads", []):
+        path = Path(directory).resolve()
+        if not path.is_relative_to(temp_root) or sid not in path.parts:
+            raise ContextNotReady("无法校验临时上下文目录归属：" + str(path))
+        add_tree(path, "scratchpad")
+    for agent_id, agent in state.get("agents", {}).items():
+        raw_path = agent.get("agent_transcript_path")
+        path = Path(raw_path).resolve() if raw_path else transcript.with_suffix("") / "subagents" / ("agent-" + agent_id + ".jsonl")
+        if not path.is_relative_to(transcript.with_suffix("")) or not path.is_file():
+            raise ContextNotReady("子代理记录尚未完整写入：" + agent_id)
+    state["excluded_files"] = excluded
+    return transcript, sources
+
+
+def file_signature(sources):
+    result = []
+    for path in sorted(sources):
+        info = path.lstat()
+        result.append((str(path), info.st_mode, info.st_ino, info.st_size, info.st_mtime_ns,
+                       os.readlink(path) if stat.S_ISLNK(info.st_mode) else None))
+    return tuple(result)
+
+
+def archive_file(source, archive_root, allow_symlink=False, allow_historical_errors=False):
+    before = source.lstat()
+    link = stat.S_ISLNK(before.st_mode)
+    if link and not allow_symlink:
+        raise ContextNotReady("上下文记录不可为符号链接：" + str(source))
+    if not link and not stat.S_ISREG(before.st_mode):
+        raise ContextNotReady("上下文不是普通文件：" + str(source))
+    link_text = os.readlink(source) if link else None
+    private_dir(archive_root / "objects")
+    fd, temporary = tempfile.mkstemp(prefix=".object-", dir=archive_root / "objects")
+    digest = hashlib.sha256()
+    size, last = 0, b""
+    warnings, warning_count = [], 0
+    try:
+        with os.fdopen(fd, "wb") as outgoing:
+            if link:
+                chunk = os.fsencode(link_text)
+                outgoing.write(chunk)
+                digest.update(chunk)
+                size = len(chunk)
+            else:
+                with os.fdopen(os.open(source, os.O_RDONLY | os.O_NOFOLLOW), "rb") as incoming:
+                    while chunk := incoming.read(1024 * 1024):
+                        outgoing.write(chunk)
+                        digest.update(chunk)
+                        size += len(chunk)
+                        last = chunk[-1:]
+            outgoing.flush()
+            os.fsync(outgoing.fileno())
+        after = source.lstat()
+        if ((before.st_mode, before.st_ino, before.st_size, before.st_mtime_ns)
+                != (after.st_mode, after.st_ino, after.st_size, after.st_mtime_ns) or size != before.st_size
+                or (link and os.readlink(source) != link_text)):
+            raise ContextNotReady("上下文仍在写入，稍后重新保存：" + str(source))
+        if not link and source.suffix == ".jsonl" and size and last != b"\n":
+            raise ContextNotReady("上下文最后一条记录尚未写完整：" + source.name)
+        if not link and source.suffix == ".jsonl":
+            valid, last_invalid, offset = 0, False, 0
+            with open(temporary, "rb") as stream:
+                for number, line in enumerate(stream, 1):
+                    try:
+                        json.loads(line)
+                        valid += 1
+                        last_invalid = False
+                    except (ValueError, UnicodeError) as exc:
+                        if not allow_historical_errors:
+                            raise ContextNotReady("上下文包含不完整的 JSON 记录：" + source.name) from None
+                        warning_count += 1
+                        last_invalid = True
+                        if len(warnings) < 20:
+                            warnings.append({"line": number, "offset": offset, "bytes": len(line),
+                                             "error": type(exc).__name__})
+                    offset += len(line)
+            # Preserve a pre-existing damaged interior row byte-for-byte. The
+            # official client already resumes such histories; no row is dropped
+            # or rewritten. An unfinished/damaged final row must still settle.
+            if warning_count and (last_invalid or not valid):
+                raise ContextNotReady("上下文末尾记录尚未通过 JSON 校验：" + source.name)
+        key = digest.hexdigest()
+        target = archive_root / "objects" / key
+        if target.exists():
+            if file_hash(target) != key:
+                raise ContextNotReady("已有上下文备份校验失败，停止切号。")
+        else:
+            os.replace(temporary, target)
+            sync_directory(target.parent)
+        item = {"source": str(source), "sha256": key, "size": size}
+        if warning_count:
+            item.update(historical_json_errors=warning_count, historical_json_error_samples=warnings)
+        if link:
+            item.update(kind="symlink", link_target=link_text)
+        return item
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(temporary)
+
+
+def file_hash(path, limit=None):
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        remaining = limit
+        while remaining is None or remaining > 0:
+            chunk = stream.read(1024 * 1024 if remaining is None else min(remaining, 1024 * 1024))
+            if not chunk:
+                break
+            digest.update(chunk)
+            if remaining is not None:
+                remaining -= len(chunk)
+    return digest.hexdigest()
+
+
+def checkpoint_context(registry, state, run_dir, phase):
+    reconcile_untracked_hooks(state)
+    reconcile_background(state)
+    transcript, sources = context_sources(registry, state)
+    journal = run_dir / "lifecycle.jsonl"
+    if journal.exists():
+        sources[journal] = "hook-journal"
+    signature = file_signature(sources)
+    archive_root = ROOT / "state" / "context-archive"
+    items = [{**archive_file(path, archive_root, allow_symlink=role == "scratchpad",
+                            allow_historical_errors=role == "main"), "role": role}
+             for path, role in sorted(sources.items())]
+    if signature != file_signature(sources):
+        raise ContextNotReady("保存期间上下文有变化，将重新保存。")
+    agents = {}
+    for path in sources:
+        if path.parent != transcript.with_suffix("") / "subagents" or path.suffix != ".jsonl" or not path.name.startswith("agent-"):
+            continue
+        agent_id = path.stem[6:]
+        meta = read_json(path.with_suffix(".meta.json"), {})
+        known = state.get("agents", {}).get(agent_id, {})
+        agents[agent_id] = {"agent_type": known.get("agent_type") or meta.get("agentType", "unknown"),
+                            "state": known.get("state", "historical-unknown"), "transcript_path": str(path)}
+        last_assistant = None
+        with path.open(encoding="utf-8") as stream:
+            for line in stream:
+                try:
+                    row = json.loads(line)
+                except ValueError:
+                    raise ContextNotReady("子代理记录格式不完整：" + path.name) from None
+                if row.get("type") == "assistant":
+                    last_assistant = row
+        if last_assistant and last_assistant.get("isApiErrorMessage"):
+            agents[agent_id]["state"] = "blocked" if safety_stop(last_assistant) else "failed"
+    launch = read_json(run_dir / "launch.json") or read_json(run_dir / "legacy-launch.json", {})
+    manifest = {"version": 1, "session_id": state["session_id"], "created_at": time.time(),
+                "phase": phase, "transcript_path": str(transcript), "cwd": launch.get("cwd") or state.get("cwd"),
+                "resume_options": launch.get("resume_options", []),
+                "files": items, "agents": agents, "pending_tools": state.get("pending_tools", {}),
+                "unattributed_events": state.get("unattributed_events", {}),
+                "background_tasks": state.get("background_tasks", []),
+                "prior_background_tasks": state.get("prior_background_tasks", []),
+                "excluded_files": state.get("excluded_files", []),
+                "limitations": "Only persisted history and hook receipts are archived. Unreturned API output is not recoverable."}
+    target = archive_root / "sessions" / state["session_id"] / (str(time.time_ns()) + "-" + phase + ".json")
+    write_json(target, manifest)
+    verify_checkpoint(target, live=True)
+    write_json(ROOT / "state" / "recovery-index" / (state["session_id"] + ".json"), {"manifest": str(target)})
+    return target
+
+
+def verify_checkpoint(path, live=False):
+    manifest = read_json(path)
+    archive_root = path.parents[2]
+    if not manifest or manifest.get("version") != 1:
+        raise ContextNotReady("无法读取上下文备份清单。")
+    for item in manifest["files"]:
+        backup = archive_root / "objects" / item["sha256"]
+        if not backup.is_file() or backup.stat().st_size != item["size"] or file_hash(backup) != item["sha256"]:
+            raise ContextNotReady("上下文备份损坏或缺失：" + item["source"])
+        if item.get("kind") == "symlink":
+            source = Path(item["source"])
+            temp_root = (Path(tempfile.gettempdir()) / ("claude-" + str(os.getuid()))).resolve()
+            if (item["role"] != "scratchpad" or not source.is_absolute()
+                    or source.parent.resolve() != source.parent or not source.is_relative_to(temp_root)
+                    or manifest["session_id"] not in source.parts or source.name == ".credentials.json"
+                    or not isinstance(item.get("link_target"), str)
+                    or backup.read_bytes() != os.fsencode(item["link_target"])):
+                raise ContextNotReady("临时上下文链接备份不合法：" + item["source"])
+            if live and (not source.is_symlink() or os.readlink(source) != item["link_target"]):
+                raise ContextNotReady("原上下文链接已缺失或被改写：" + item["source"])
+            continue
+        if item.get("kind") not in (None, "file"):
+            raise ContextNotReady("未知上下文备份类型。")
+        if live and item["role"] != "hook-journal":
+            source = Path(item["source"])
+            if source.is_symlink() or not source.is_file() or source.stat().st_size < item["size"] or file_hash(source, item["size"]) != item["sha256"]:
+                raise ContextNotReady("原上下文已缺失或被改写，未启动恢复：" + item["source"])
+    return manifest
+
+
+def restore_missing_context(path, registry):
+    """Restore verified missing files only; never overwrite conflicting history."""
+    manifest = verify_checkpoint(path)
+    sid = manifest["session_id"]
+    uuid.UUID(sid)
+    roots = {(Path(directory) / "projects").resolve() for directory in registry["profiles"].values()}
+    main = Path(manifest["transcript_path"]).resolve()
+    if main.name != sid + ".jsonl" or not any(main.is_relative_to(root) for root in roots):
+        raise ContextNotReady("备份的原会话路径不在当前配置中。")
+    task_roots = [(Path(directory) / "tasks" / sid).resolve() for directory in registry["profiles"].values()]
+    temp_root = (Path(tempfile.gettempdir()) / ("claude-" + str(os.getuid()))).resolve()
+    missing = []
+    link_paths = {Path(item["source"]) for item in manifest["files"] if item.get("kind") == "symlink"}
+    for item in manifest["files"]:
+        if item["role"] == "hook-journal":
+            continue
+        target = Path(item["source"])
+        is_link = item.get("kind") == "symlink"
+        resolved = target.parent.resolve() / target.name if is_link else target.resolve()
+        allowed = resolved == main or resolved.is_relative_to(main.with_suffix("")) or any(resolved.is_relative_to(root) for root in task_roots)
+        allowed = allowed or (item["role"] == "scratchpad" and resolved.is_relative_to(temp_root) and sid in resolved.parts)
+        if (not allowed or target.name == ".credentials.json" or (target.is_symlink() and not is_link)
+                or any(parent in link_paths for parent in target.parents)):
+            raise ContextNotReady("拒绝恢复越界路径或符号链接。")
+        if is_link and (target.exists() or target.is_symlink()):
+            if not target.is_symlink() or os.readlink(target) != item["link_target"]:
+                raise ContextNotReady("现有链接与备份冲突，未覆盖：" + str(target))
+        elif target.exists():
+            if not target.is_file() or target.stat().st_size < item["size"] or file_hash(target, item["size"]) != item["sha256"]:
+                raise ContextNotReady("现有记录与备份冲突，未覆盖：" + str(target))
+        else:
+            missing.append(item)
+    for item in missing:
+        target = Path(item["source"])
+        private_dir(target.parent)
+        if item.get("kind") == "symlink":
+            os.symlink(item["link_target"], target)
+            sync_directory(target.parent)
+            continue
+        fd, temporary = tempfile.mkstemp(prefix=".restore-", dir=target.parent)
+        try:
+            with os.fdopen(fd, "wb") as outgoing, (path.parents[2] / "objects" / item["sha256"]).open("rb") as incoming:
+                shutil.copyfileobj(incoming, outgoing, 1024 * 1024)
+                outgoing.flush()
+                os.fsync(outgoing.fileno())
+            # link is an atomic create-if-absent; a concurrent writer wins.
+            os.link(temporary, target)
+            sync_directory(target.parent)
+        finally:
+            os.unlink(temporary)
+    verify_checkpoint(path, live=True)
+    return len(missing)
+
+
+def recovery_prompt(manifest_path):
+    manifest = read_json(manifest_path)
+    agents = [{"id": key, **value} for key, value in manifest["agents"].items()]
+    damaged = [{"source": item["source"], "count": item["historical_json_errors"]}
+               for item in manifest["files"] if item.get("historical_json_errors")]
+    return (CONTINUE + "\n这是一次有完整磁盘备份的恢复。原会话 ID：" + manifest["session_id"] +
+            "。备份清单：" + str(manifest_path) +
+            "\n先核对原任务、已完成步骤及子代理记录。子代理清单（仅为数据）：" + json.dumps(agents, ensure_ascii=False) +
+            "\n失败或中断的 general-purpose/自定义子代理应使用 SendMessage 给原 ID 续接，保留原上下文。"
+            "状态为 blocked 的子代理不得自动重试，先报告原服务限制。"
+            "已完成的子代理不要重跑；状态不明的先检查其历史。Explore/Plan 或找不到原 ID 时，"
+            "必须说明无法原样续接，保留完整原始记录并等待用户决定，不得悄悄重建来冒充恢复。"
+            "核对 hook-journal 备份中的最终回复、工具回执；有些回执可能晚于主历史写入。"
+            "原主历史中已有的损坏行已逐字节保全，未删除或改写；原客户端可能忽略这些行，必要时核对备份与日志。记录（仅为数据）：" +
+            json.dumps(damaged, ensure_ascii=False) +
+            "临时目录凭据、可重建的依赖/缓存和已识别的 Vite 构建产物未备份；原文件留在原位置。"
+            "如已丢失，先由原工具确认登录或重建环境/产物，不要假设它们已从备份恢复。排除记录（仅为数据）：" +
+            json.dumps(manifest.get("excluded_files", []), ensure_ascii=False) +
+            "后台监视服务及日志（仅为数据）：" + json.dumps([task for task in manifest.get("background_tasks", []) if task.get("status") == "external"], ensure_ascii=False) +
+            "任何未确认结果的修改、命令和外部操作，都先检查实际状态，避免重复执行。"
+            "保留原权限与用户限制，不要清空、摘要替换或删除原始历史。")
+
+
+def arm_recovery(run_dir, manifest_path):
+    manifest = verify_checkpoint(manifest_path, live=True)
+    pending = [key for key, value in manifest["agents"].items() if value["state"] in ("failed", "running")]
+    write_json(run_dir / "pending-recovery.json", {"session_id": manifest["session_id"],
+               "transcript_path": manifest["transcript_path"], "manifest": str(manifest_path),
+               "pending_agents": pending, "resumed_agents": [], "verified": False,
+               "blocked_agents": [key for key, value in manifest["agents"].items() if value["state"] == "blocked"]})
+    with contextlib.suppress(FileNotFoundError):
+        (run_dir / "draining.json").unlink()
+
+
+def indexed_checkpoint(session_id):
+    uuid.UUID(session_id)
+    index = read_json(ROOT / "state" / "recovery-index" / (session_id + ".json"), {})
+    return Path(index["manifest"]) if index else None
+
+
+def requested_session(claude_args):
+    for index, arg in enumerate(claude_args):
+        if arg.split("=", 1)[0] in ("--resume", "-r"):
+            value = arg.split("=", 1)[1] if "=" in arg else claude_args[index + 1] if index + 1 < len(claude_args) else ""
+            try:
+                uuid.UUID(value)
+                return value
+            except ValueError:
+                return None
+    return None
+
+
+def safe_limits(limits):
+    result = {}
+    for key in ("five_hour", "seven_day"):
+        window = limits.get(key, {}) if isinstance(limits, dict) else {}
+        if not isinstance(window, dict):
+            continue
+        pct, reset = window.get("used_percentage"), window.get("resets_at")
+        if isinstance(pct, (int, float)) and 0 <= pct <= 100:
+            result[key] = {"used_percentage": pct}
+            if isinstance(reset, (int, float)):
+                result[key]["resets_at"] = reset
+    return result
+
+
+def native_hook(kind, run_dir, account):
+    payload = json.load(sys.stdin)
+    if kind == "_status":
+        value = {"at": time.time(), "account": account,
+                 "session_id": payload.get("session_id"),
+                 "limits": safe_limits(payload.get("rate_limits"))}
+        write_json(run_dir / (account + "-limits.json"), value)
+        parts = [account, str((payload.get("model") or {}).get("display_name", "Claude"))]
+        launched = read_json(run_dir / "launch.json", {}).get("launcher_version")
+        if launched and launched != VERSION:
+            parts.append("启动器待重载")
+        retry = read_json(run_dir / "retry-status.json", {})
+        if (retry.get("session_id") == value["session_id"] and retry.get("account") == account and
+                retry.get("client_id") == os.environ.get("CLAUDE_ACCOUNTS_CLIENT_ID")):
+            if retry.get("phase") == "waiting":
+                parts.append(f"登录刷新等待 {max(0, int(retry['next_at'] - time.time()))}s 后自动续接")
+            elif retry.get("phase") == "submitted":
+                parts.append("已自动重试续接")
+            elif retry.get("phase") == "exhausted":
+                parts.append("登录刷新冲突仍未解除，自动重试已停止")
+        for label, key in (("5h", "five_hour"), ("7d", "seven_day")):
+            if key in value["limits"]:
+                parts.append(f"{label} {value['limits'][key]['used_percentage']:g}%")
+        context = (payload.get("context_window") or {}).get("used_percentage")
+        if isinstance(context, (int, float)):
+            parts.append(f"context {context:g}%")
+        # Preserve an existing user status-line command when one was configured.
+        old = read_json(run_dir / "previous-statusline.json", {})
+        if isinstance(old, dict) and old.get("type") == "command" and old.get("command"):
+            try:
+                previous = subprocess.run(old["command"], shell=True, input=json.dumps(payload),
+                                          capture_output=True, text=True, timeout=5)
+                if previous.returncode == 0 and previous.stdout.strip():
+                    print(previous.stdout.rstrip(), end=" | ")
+            except subprocess.SubprocessError:
+                pass
+        print(" | ".join(parts))
+        return
+    result = lifecycle_record(run_dir, account, payload)
+    event = {"at": time.time(), "account": account,
+             "client_id": os.environ.get("CLAUDE_ACCOUNTS_CLIENT_ID"),
+             "event": payload.get("hook_event_name"),
+             "session_id": payload.get("session_id"), "agent_id": payload.get("agent_id"),
+             "transcript_path": payload.get("transcript_path")}
+    if event["event"] == "StopFailure":
+        event.update(error=payload.get("error"),
+                     details=str(payload.get("error_details", ""))[:2000],
+                     message=str(payload.get("last_assistant_message", ""))[:2000])
+        if account_unavailable(event):
+            set_profile_disabled(account, "官方客户端明确报告账号被停用或封禁；需人工确认后启用。", "official_error")
+            event["account_disabled"] = True
+        usage = read_json(run_dir / (account + "-limits.json"), {})
+        if quota_failure(event, usage):
+            blocked_until = quota_reset_from_error(event, usage)
+            record_quota(ROOT / "state", account, blocked_until)
+            event["blocked_until"] = blocked_until
+            if event.get("agent_id") and (run_dir / "launch.json").exists():
+                # Compatibility with an already-running context-safe controller:
+                # it filters child hooks, so publish an account-level quota event.
+                # The original agent ID and full receipt remain in lifecycle.jsonl.
+                event["origin_agent_id"] = event["agent_id"]
+                event["agent_id"] = None
+        if not (run_dir / "launch.json").exists() and quota_failure(event, usage):
+            # Old live controllers still contain the five-second SIGKILL path.
+            # Do not send them a rotation event after installing this upgrade.
+            event["event"] = "LegacyRotationPaused"
+            write_json(run_dir / "legacy-rotation-paused.json", {"session_id": payload["session_id"], "at": time.time()})
+            try:
+                state = read_json(session_state_path(run_dir, payload["session_id"]))
+                checkpoint_context(load_registry(), state, run_dir, "legacy-live")
+            except (OSError, RuntimeError, ValueError) as exc:
+                say("旧窗口自动切号已暂停，原进程保留；上下文备份状态：" + str(exc))
+            say("此窗口仍运行旧版启动器，已阻止其强制切号。请在任务停止后用新版 recover 恢复原会话。")
+    with state_lock(run_dir / "events.lock"):
+        append_record(run_dir / "events.jsonl", event)
+    if result:
+        print(json.dumps(result, ensure_ascii=False))
+
+
+def quota_failure(event, usage):
+    if account_unavailable(event):
+        return False
+    if event.get("error") != "rate_limit":
+        return False
+    text = (str(event.get("details", "")) + " " + str(event.get("message", ""))).lower()
+    if any(word in text for word in ("[cyber]", "safeguard", "usage policy", "account_on_hold")):
+        return False
+    explicit = re.search(r"you[’']ve hit (?:your |the )?(?:(?:session|weekly|usage) )?limit", text)
+    explicit = explicit or re.search(r"(?:session|weekly|usage) limit (?:reached|exceeded)", text)
+    if explicit:
+        return True
+    # A child's generic 429 can be a separate concurrency/rate limit. It must
+    # explicitly identify subscription exhaustion before affecting the parent.
+    if event.get("agent_id"):
+        return False
+    if time.time() - usage.get("at", 0) > 120:
+        return False
+    return any(w.get("used_percentage", 0) >= 100 and
+               w.get("resets_at", time.time() + 1) > time.time()
+               for w in usage.get("limits", {}).values())
+
+
+def quota_reset_from_error(event, usage):
+    """Remember exhaustion even when native statusLine drops the 5h field."""
+    now = time.time()
+    reset = limits_blocked_until(usage)
+    text = str(event.get("details", "")) + " " + str(event.get("message", ""))
+    weekly = bool(re.search(r"weekly|week(?:ly)? limit", text, re.I))
+    key = "seven_day" if weekly else "five_hour"
+    window = usage.get("limits", {}).get(key, {})
+    if now - usage.get("at", 0) <= 120 and window.get("resets_at", 0) > now:
+        reset = max(reset, window["resets_at"])
+    match = re.search(r"resets\s+(?:(\w{3})\s+(\d{1,2}),?\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)\s*\(([^)]+)\)", text, re.I)
+    if match:
+        month, day, hour, minute, half, zone = match.groups()
+        try:
+            tz = datetime.timezone.utc if zone.upper() in ("UTC", "GMT") else ZoneInfo(zone)
+            local = datetime.datetime.fromtimestamp(now, tz)
+            h, minute = int(hour), int(minute or 0)
+            if not 1 <= h <= 12 or not 0 <= minute < 60:
+                raise ValueError("Invalid clock time")
+            h = h % 12 + (12 if half.lower() == "pm" else 0)
+            dt = local.replace(hour=h, minute=minute, second=0, microsecond=0)
+            if month:
+                number = ("jan feb mar apr may jun jul aug sep oct nov dec".split().index(month.lower()) + 1)
+                dt = dt.replace(month=number, day=int(day))
+                if dt.timestamp() <= now:
+                    dt = dt.replace(year=dt.year + 1)
+            elif dt.timestamp() <= now:
+                dt += datetime.timedelta(days=1)
+            if now < dt.timestamp() <= now + (8*86400 if weekly else 6*3600):
+                reset = max(reset, dt.timestamp())
+        except (ValueError, ZoneInfoNotFoundError):
+            pass
+    return reset if reset > now else 0
+
+
+def limits_blocked_until(usage):
+    return max([w.get("resets_at", 0) for w in usage.get("limits", {}).values()
+                if w.get("used_percentage", 0) >= 100] + [0])
+
+
+def merge_quota_record(first, second):
+    """Keep newer evidence and an earlier reset that had not passed by then."""
+    older, newer = sorted((first, second), key=lambda value: value.get("recorded_at", 0))
+    result = dict(newer)
+    # A complete authenticated usage query supersedes limits that predate the
+    # query. Newer failures and the explicit disabled sentinel always win.
+    if (newer.get("source") == "official_usage_recovery" and
+            newer.get("cleared_through", 0) >= older.get("recorded_at", 0) and
+            older.get("blocked_until") != DISABLED_UNTIL):
+        return result
+    if older.get("blocked_until", 0) > newer.get("recorded_at", 0):
+        result["blocked_until"] = max(older["blocked_until"], newer.get("blocked_until", 0))
+    return result
+
+
+def read_quota_state(state_dir):
+    # Read the old aggregate file as well: a session started before this upgrade
+    # may still be writing it. New sessions never overwrite that legacy file.
+    result = read_json(state_dir / "quota.json", {})
+    for path in (state_dir / "quotas").glob("*.json"):
+        if NAME.fullmatch(path.stem):
+            result[path.stem] = merge_quota_record(result.get(path.stem, {}), read_json(path, {}))
+    return result
+
+
+def record_quota(state_dir, account, blocked_until):
+    # Separate files avoid losing one account's update when another finishes.
+    # A short per-account lock also merges simultaneous reports of the same limit.
+    with state_lock(state_dir / "quota-locks" / (account + ".lock")):
+        previous = read_quota_state(state_dir).get(account, {})
+        record = merge_quota_record(previous, {"blocked_until": blocked_until, "recorded_at": time.time()})
+        write_json(state_dir / "quotas" / (account + ".json"), record)
+    return read_quota_state(state_dir)
+
+
+def quota_number(value):
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+
+
+def record_quota_recovery(state_dir, account, windows, observed_at, request_started_at):
+    """Unblock only on a fresh, complete official query, never on a manual card
+    note, expired timer, merged partial samples, or an old status-line render.
+    The start time is a fence against a limit reported while the query is in flight.
+    """
+    now = time.time()
+    if (not isinstance(account, str) or not NAME.fullmatch(account) or
+            not quota_number(observed_at) or not quota_number(request_started_at) or
+            not now - 300 <= request_started_at <= observed_at <= now + 1 or
+            not isinstance(windows, dict)):
+        return False
+    for key in ("five_hour", "seven_day"):
+        window = windows.get(key, {})
+        if not isinstance(window, dict):
+            return False
+        used, reset, at = (window.get(k) for k in ("used_percentage", "resets_at", "observed_at"))
+        if (not quota_number(used) or not 0 <= used < 100 or not quota_number(at) or
+                not request_started_at <= at <= observed_at or
+                window.get("source") not in ("official_cli_usage", "official_oauth_api") or
+                (reset is None and used != 0) or
+                (reset is not None and (not quota_number(reset) or reset <= now))):
+            return False
+    # Use the same lock ordering as disabling an account.
+    with state_lock(state_dir / "registry.lock"):
+        registry = read_json(state_dir.parent / "accounts.json", {})
+        if account not in registry.get("profiles", {}) or account in registry.get("disabled", {}):
+            return False
+        with state_lock(state_dir / "quota-locks" / (account + ".lock")):
+            previous = read_quota_state(state_dir).get(account, {})
+            if (previous.get("blocked_until") == DISABLED_UNTIL or
+                    previous.get("recorded_at", 0) >= request_started_at):
+                return False
+            if (previous.get("blocked_until", 0) <= now and
+                    previous.get("source") != "official_usage_recovery"):
+                return False
+            record = {"blocked_until": request_started_at, "recorded_at": request_started_at,
+                      "cleared_through": request_started_at, "available_at": observed_at,
+                      "source": "official_usage_recovery",
+                      "previous_blocked_until": previous.get("previous_blocked_until", previous.get("blocked_until")),
+                      "windows": {k: windows[k] for k in ("five_hour", "seven_day")}}
+            # A positive elapsed timestamp also lets already-running old launchers
+            # remove the account from their per-run attempted set.
+            write_json(state_dir / "quotas" / (account + ".json"), record)
+            return True
+
+
+def sync_monitored_recoveries(state_dir):
+    records = read_json(state_dir / "monitor/accounts.json", {})
+    for name, record in records.items():
+        if record.get("loggedIn") is True and not record.get("error"):
+            record_quota_recovery(state_dir, name, record.get("windows"), record.get("checked_at"),
+                                  record.get("usage_query_started_at", 0))
+
+
+def selection_candidates(registry, names, current, attempted, quotas, after=False):
+    now = time.time()
+    candidates = [name for name in account_ring(names, current, after=after)
+                  if name not in attempted and not disabled_reason(registry, name)
+                  and quotas.get(name, {}).get("blocked_until", 0) <= now]
+    # Keep ring order within each group. A verified reset takes priority over an
+    # account whose old wait timer merely elapsed and has not been checked yet.
+    def recovered(name):
+        record = quotas.get(name, {})
+        return (record.get("source") == "official_usage_recovery" and
+                now - 300 <= record.get("available_at", 0) <= now + 1)
+    return sorted(candidates, key=lambda name: not recovered(name))
+
+
+def overlay_settings(run_dir, account, registry):
+    command = shlex.join([sys.executable, str(SCRIPT), "_hook", str(run_dir), account])
+    status_command = shlex.join([sys.executable, str(SCRIPT), "_status", str(run_dir), account])
+    value = {"hooks": {name: [{"hooks": [{"type": "command", "command": command, "timeout": 15}]}]
+                       for name in LIFECYCLE},
+        "statusLine": {"type": "command", "command": status_command}}
+    original = read_json(Path(registry["profiles"][account]) / "settings.json", {})
+    write_json(run_dir / "previous-statusline.json", original.get("statusLine", {}))
+    path = run_dir / (account + "-settings.json")
+    write_json(path, value)
+    return path
+
+
+def persistent_arguments(claude_args):
+    """Validate supported options and preserve restrictions across account switches."""
+    scalar = {"--model", "--effort", "--permission-mode", "--agent", "--autocompact",
+              "--tools", "--allowedTools", "--allowed-tools", "--disallowedTools",
+              "--disallowed-tools", "--add-dir", "--mcp-config", "--append-system-prompt",
+              "--system-prompt", "--name", "-n", "--fallback-model"}
+    simple = {"--verbose", "--ax-screen-reader", "--no-chrome", "--chrome", "--ide",
+              "--strict-mcp-config"}
+    initial_only = {"--session-id"}
+    result = []
+    index = 0
+    prompts = 0
+    while index < len(claude_args):
+        item = claude_args[index]
+        key = item.split("=", 1)[0]
+        if item == "--":
+            prompts += len(claude_args) - index - 1
+            break
+        if key in scalar or key in initial_only:
+            if "=" in item:
+                if key in scalar:
+                    result.append(item)
+            elif index + 1 < len(claude_args):
+                if key in scalar:
+                    result.extend(claude_args[index:index + 2])
+                index += 1
+            else:
+                raise RuntimeError(f"参数 {key} 缺少值。")
+        elif item in simple:
+            result.append(item)
+        elif key in ("--resume", "-r", "--from-pr"):
+            if "=" not in item and index + 1 < len(claude_args) and not claude_args[index + 1].startswith("-"):
+                index += 1
+        elif item in ("--continue", "-c", "--fork-session"):
+            pass
+        elif item.startswith("-"):
+            raise RuntimeError(f"自动切换暂不支持参数 {key}；可使用 claude-accounts use 调用原版客户端。")
+        else:
+            prompts += 1
+        index += 1
+    if prompts > 1:
+        raise RuntimeError("请用引号把任务写成一个参数；每个 --add-dir / --mcp-config 只传一个值，可重复选项。")
+    return result
+
+
+def resume_arguments(claude_args, session_id, manifest_path=None):
+    prompt = recovery_prompt(manifest_path) if manifest_path else CONTINUE
+    return persistent_arguments(claude_args) + ["--resume", session_id, prompt]
+
+
+def terminate_child(pid, fd, timeout=30):
+    """Request exit without SIGKILL: a stuck process must not lose its buffers."""
+    with contextlib.suppress(ProcessLookupError):
+        os.kill(pid, signal.SIGTERM)
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            waited, _ = os.waitpid(pid, os.WNOHANG)
+            if waited:
+                return True
+        except ChildProcessError:
+            return True
+        ready, _, _ = select.select([fd], [], [], 0.1)
+        if ready:
+            try:
+                chunk = os.read(fd, 65536)
+                if chunk:
+                    os.write(sys.stdout.fileno(), chunk)
+            except OSError:
+                pass
+    say("原进程尚未退出；未强制终止。")
+    return False
+
+
+def rotation_busy(state):
+    reconcile_background(state)
+    running = [key for key, value in state.get("agents", {}).items() if value.get("state") == "running"]
+    tools = list(state.get("pending_tools", {}))
+    background = [task for task in state.get("background_tasks", []) if task.get("status") in ("running", "pending")]
+    return running, tools, background
+
+
+def account_ring(accounts, current, after=False):
+    """Stable registry order; return to main only after reaching the end."""
+    index = accounts.index(current) + int(after)
+    return accounts[index:] + accounts[:index]
+
+
+def login_refresh_busy(event):
+    """Only the native refresh-lock failure, never a generic API/auth error."""
+    text = str(event.get("details", "")) + " " + str(event.get("message", ""))
+    return (event.get("error") == "server_error" and
+            not event.get("agent_id") and not event.get("origin_agent_id") and
+            not account_unavailable(event) and not safety_stop(event) and
+            "could not refresh your login because another claude code process is refreshing it" in text.lower())
+
+
+def terminal_response_only(data):
+    # Terminal negotiation is not typing: VS Code/xterm answers these startup
+    # queries automatically. Unknown, mixed or incomplete input still cancels.
+    return bool(re.fullmatch(
+        rb"(?:\x1b\[(?:[?>]?[0-9;:]*c|[0-9]+;[0-9]+R|\?[0-9;]+\$y|\?[0-9]+u)|"
+        rb"\x1b\](?:10|11|12);(?:rgb|rgba):[0-9a-fA-F/]+(?:\x07|\x1b\\))+", data))
+
+
+def wait_for_login_refresh(registry, account, timeout=75):
+    """Let native OAuth locks settle; native code owns stale-lock reclamation.
+
+    Native auth status can start a refresh and exit while acquiring its locks.
+    Both the current and legacy lock use a 60-second stale threshold. Never
+    remove either lock, or assume that a slow live refresh has stopped.
+    """
+    directory = Path(registry["profiles"][account]).resolve()
+    paths = (directory / ".oauth_refresh.lock", directory.with_name(directory.name + ".lock"))
+    deadline, notified = time.monotonic() + timeout, False
+    while True:
+        if disabled_reason(registry, account):
+            raise RuntimeError(f"账号 {account} 已停用，已停止等待登录刷新。")
+        recent = False
+        for path in paths:
+            try:
+                info = path.lstat()
+                recent |= stat.S_ISDIR(info.st_mode) and time.time() - info.st_mtime < 61
+            except FileNotFoundError:
+                pass
+        if not recent:
+            return True
+        if not notified:
+            say(f"{account} 登录正在刷新，等待原生刷新锁释放或过期后启动。")
+            notified = True
+        if time.monotonic() >= deadline:
+            say("登录刷新仍在进行，交由原版客户端处理；未删除锁或终止其他窗口。")
+            return False
+        time.sleep(.25)
+
+
+class RecoveryRetry:
+    """Bounded retries for a verified recovery or a receipted user request.
+
+    Keyboard input or task progress cancels the current request's retries.
+    In-place retries need no restore manifest: the original process owns its
+    context. Only the exact native OAuth lock error is eligible for retry.
+    """
+    def __init__(self, run_dir, account, client_id, session_id, allow_user_prompts=False):
+        self.run_dir, self.account = run_dir, account
+        self.client_id, self.session_id = client_id, session_id
+        recovery = read_json(run_dir / "pending-recovery.json", {})
+        self.phase = "armed" if (session_id and client_id and recovery.get("manifest") and
+                                 recovery.get("session_id") == session_id) else "disabled"
+        self.started = self.seen_prompt = False
+        self.expected_prompts = 1
+        self.attempts = 0
+        self.deadline = None
+        self.allow_user_prompts = allow_user_prompts
+        self.user_prompt = False
+        self.last_input_at = 0
+        self.input_complete = True
+
+    @property
+    def prompt(self):
+        return LOGIN_PROMPT_RETRY if self.user_prompt else LOGIN_RETRY_PROMPT
+
+    def keyboard(self, data):
+        self.last_input_at = time.time()
+        self.input_complete = data.endswith(b"\r")
+        self.finish("keyboard-input")
+
+    @property
+    def active(self):
+        return self.phase in ("armed", "waiting", "submitted")
+
+    def status(self, phase, **details):
+        self.phase = phase
+        write_json(self.run_dir / "retry-status.json", {
+            "at": time.time(), "account": self.account, "client_id": self.client_id,
+            "session_id": self.session_id, "phase": phase, "attempts": self.attempts, **details})
+
+    def finish(self, reason, phase="cancelled"):
+        if self.active:
+            self.deadline = None
+            self.status(phase, reason=reason)
+
+    def observe(self, event):
+        kind = event.get("event")
+        if (event.get("account") != self.account or event.get("client_id") != self.client_id or
+                (event.get("agent_id") and kind not in ("SubagentStart", "SubagentStop"))):
+            return
+        if self.allow_user_prompts:
+            if kind == "SessionEnd" and event.get("session_id") == self.session_id:
+                self.finish("session-ended")
+                self.started = False
+                return
+            # In-app /resume changes the session without changing the launch
+            # arguments. A native receipt establishes the current session.
+            if kind == "SessionStart" and (not self.active or event.get("session_id") != self.session_id):
+                try:
+                    uuid.UUID(event.get("session_id", ""))
+                except (ValueError, TypeError, AttributeError):
+                    self.finish("invalid-session")
+                    return
+                self.finish("session-changed")
+                self.session_id = event["session_id"]
+                self.started, self.seen_prompt = True, False
+                self.phase, self.expected_prompts = "disabled", 0
+                return
+            if (kind == "UserPromptSubmit" and self.started and event.get("session_id") == self.session_id
+                    and (not self.active or not self.expected_prompts)):
+                if not self.input_complete or self.last_input_at > event.get("at", time.time()):
+                    self.finish("keyboard-draft")
+                    return
+                # Retry only a receipted user request, before any task progress.
+                # A later user request starts a new budget; duplicate failures do not.
+                self.user_prompt, self.seen_prompt = True, True
+                self.expected_prompts, self.attempts, self.deadline = 0, 0, None
+                self.status("armed")
+                return
+        if not self.active:
+            return
+        if event.get("session_id") != self.session_id:
+            self.finish("session-changed")
+            return
+        if kind == "SessionStart":
+            recovery = read_json(self.run_dir / "pending-recovery.json", {})
+            if self.started or not recovery.get("verified") or recovery.get("session_id") != self.session_id or recovery.get("error"):
+                self.finish("recovery-not-verified")
+            else:
+                self.started = True
+        elif kind == "UserPromptSubmit":
+            if not self.started or not self.expected_prompts:
+                self.finish("new-user-prompt")
+            else:
+                self.expected_prompts -= 1
+                self.seen_prompt = True
+        elif kind in ("PreToolUse", "PostToolUse", "PostToolUseFailure", "SubagentStart", "Stop"):
+            self.finish("task-progress", "completed")
+        elif kind == "SessionEnd":
+            self.finish("session-ended")
+            self.started = False
+        elif kind == "StopFailure":
+            if not self.started or not self.seen_prompt or not login_refresh_busy(event):
+                self.finish("non-retryable-failure")
+            elif self.phase == "waiting":
+                return  # Duplicate receipts do not reset the timer or retry budget.
+            elif self.expected_prompts:
+                self.finish("retry-submit-not-confirmed")
+            elif self.attempts >= len(LOGIN_RETRY_DELAYS):
+                self.finish("login-refresh-still-busy", "exhausted")
+                say("登录刷新冲突在两次重试后仍未解除；保留会话，停止重试。")
+            else:
+                delay = LOGIN_RETRY_DELAYS[self.attempts]
+                self.deadline = time.monotonic() + delay
+                self.status("waiting", next_at=time.time() + delay)
+                say(f"遇到登录刷新冲突，{delay:g} 秒后重试原请求；输入任意按键即取消本次自动重试。")
+
+    def due(self):
+        return self.phase == "waiting" and time.monotonic() >= self.deadline
+
+    def can_submit(self, registry):
+        try:
+            recovery = read_json(self.run_dir / "pending-recovery.json", {})
+            state = read_json(session_state_path(self.run_dir, self.session_id), {})
+            disabled = disabled_reason(registry, self.account)
+        except (OSError, ValueError, RuntimeError):
+            self.finish("recovery-state-unreadable")
+            return False
+        busy = (any(agent.get("state") == "running" for agent in state.get("agents", {}).values()) or
+                state.get("pending_tools") or any(task.get("status") in ("running", "pending")
+                                                 for task in state.get("background_tasks", [])))
+        invalid_recovery = (not self.user_prompt and
+                            (not recovery.get("verified") or recovery.get("session_id") != self.session_id or
+                             recovery.get("error")))
+        if (invalid_recovery or recovery.get("error") or state.get("client_id") != self.client_id or
+                state.get("account") != self.account or state.get("ended_at") or
+                disabled or busy):
+            self.finish("session-no-longer-idle-or-verified")
+            return False
+        return self.due()
+
+    def submitted(self):
+        self.attempts += 1
+        self.expected_prompts += 1
+        self.deadline = None
+        self.status("submitted")
+        say(f"已自动重试续接（{self.attempts}/{len(LOGIN_RETRY_DELAYS)}），保留原会话与子代理 ID。")
+
+
+def interactive_child(command, env, events, account, run_dir, registry):
+    import fcntl
+    import pty
+    import termios
+    import tty
+    pid, fd = pty.fork()
+    if pid == 0:
+        try:
+            os.execvpe(command[0], command, env)
+        except Exception as exc:
+            print(str(exc), file=sys.stderr, flush=True)
+            os._exit(127)
+    saved = termios.tcgetattr(sys.stdin.fileno())
+    prior_winch = signal.getsignal(signal.SIGWINCH)
+    reaped = False
+    session_id = None
+    pending_event = ""
+    rotation = None
+    checkpoint = None
+    shutdown_requested = False
+    last_signature = None
+    quiet_since = time.monotonic()
+    last_notice = 0
+    last_problem = None
+    session_blocked = False
+    retry = RecoveryRetry(run_dir, account, env.get("CLAUDE_ACCOUNTS_CLIENT_ID"), requested_session(command),
+                          allow_user_prompts=True)
+
+    def rotation_status(phase, **details):
+        write_json(run_dir / "rotation-status.json", {
+            "at": time.time(), "account": account, "session_id": session_id,
+            "phase": phase, **details})
+
+    def resize(*_):
+        with contextlib.suppress(OSError):
+            size = fcntl.ioctl(sys.stdin.fileno(), termios.TIOCGWINSZ, b"\0" * 8)
+            fcntl.ioctl(fd, termios.TIOCSWINSZ, size)
+
+    try:
+        resize()
+        signal.signal(signal.SIGWINCH, resize)
+        tty.setraw(sys.stdin.fileno())
+        while True:
+            waited, status = os.waitpid(pid, os.WNOHANG)
+            if waited:
+                reaped = True
+            # Process hooks even when Claude exits immediately after publishing one.
+            pending_event += events.read()
+            lines = pending_event.split("\n")
+            pending_event = lines.pop()
+            for line in lines:
+                if not line:
+                    continue
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if event.get("account") != account:
+                    continue
+                if event.get("client_id") and event["client_id"] != env.get("CLAUDE_ACCOUNTS_CLIENT_ID"):
+                    continue
+                retry.observe(event)
+                if event.get("event") == "SessionStart" and not event.get("agent_id"):
+                    session_id = event.get("session_id")
+                    recovery_state = read_json(run_dir / "pending-recovery.json", {})
+                    if recovery_state.get("error"):
+                        say(recovery_state["error"])
+                        return {"rotate": False, "exit_code": 75}
+                elif event.get("event") == "StopFailure":
+                    if session_id == event.get("session_id") and account_unavailable(event):
+                        say(f"{account} 已停用；保留当前会话，不自动重试此账号错误。")
+                        rotation_status("account-disabled")
+                        rotation = None
+                        session_blocked = True
+                        continue
+                    usage = read_json(run_dir / (account + "-limits.json"), {})
+                    if not session_blocked and session_id == event.get("session_id") and quota_failure(event, usage):
+                        try:
+                            uuid.UUID(session_id)
+                        except (ValueError, TypeError):
+                            continue
+                        if rotation is None:
+                            rotation = {"rotate": True, "session_id": session_id, "usage": usage}
+                            write_json(run_dir / "draining.json", {"session_id": session_id})
+                            rotation_status("draining")
+                            say("额度耗尽：等待子代理和工具结束，保存并校验完整上下文后再切换。")
+            if rotation:
+                retry.finish("quota-rotation")
+                state = read_json(session_state_path(run_dir, session_id), {})
+                try:
+                    if not state:
+                        raise ContextNotReady("未取得会话生命周期记录。")
+                    if reaped:
+                        if checkpoint:
+                            verify_checkpoint(checkpoint, live=True)
+                        final_checkpoint = checkpoint_context(registry, state, run_dir, "exited")
+                        write_json(run_dir / "last-checkpoint.json", {"manifest": str(final_checkpoint)})
+                        if state.get("pending_tools"):
+                            say("已保存上下文，但退出时仍有工具结果未确认，未自动继续。备份：" + str(final_checkpoint))
+                            return {"rotate": False, "exit_code": 75}
+                        rotation["manifest"] = final_checkpoint
+                        rotation_status("saved", manifest=str(final_checkpoint))
+                        say("上下文校验通过：" + str(final_checkpoint))
+                        return rotation
+                    if not shutdown_requested:
+                        running, tools, background = rotation_busy(state)
+                        if running or tools or background:
+                            raise ContextNotReady(f"仍有 {len(running)} 个子代理、{len(tools)} 个工具调用、{len(background)} 个后台任务未结束；保留进程等待。")
+                        _, sources = context_sources(registry, state)
+                        signature = (file_signature(sources), state.get("updated_at"))
+                        if signature != last_signature:
+                            last_signature, quiet_since = signature, time.monotonic()
+                        elif time.monotonic() - quiet_since >= 2:
+                            rotation_status("saving", files=len(sources))
+                            checkpoint = checkpoint_context(registry, state, run_dir, "before-exit")
+                            write_json(run_dir / "last-checkpoint.json", {"manifest": str(checkpoint)})
+                            # Only ask the idle process to exit; never force-kill it.
+                            os.kill(pid, signal.SIGTERM)
+                            shutdown_requested = True
+                            rotation_status("waiting-exit", manifest=str(checkpoint))
+                            last_notice = time.monotonic()
+                    elif time.monotonic() - last_notice >= 30:
+                        say("上下文已备份，仍在等待原进程自行退出；不会强杀或启动第二份会话。")
+                        last_notice = time.monotonic()
+                except (OSError, ValueError, RuntimeError) as exc:
+                    problem = str(exc)
+                    if problem != last_problem:
+                        rotation_status("blocked" if reaped else "waiting-context", reason=problem)
+                        say(problem)
+                        last_problem = problem
+                        last_notice = time.monotonic()
+                    if reaped:
+                        say("上下文未通过最终校验，已停止自动切换：" + str(exc))
+                        if checkpoint:
+                            say("退出前备份：" + str(checkpoint))
+                        return {"rotate": False, "exit_code": 75}
+                    if time.monotonic() - last_notice >= 30:
+                        say(str(exc))
+                        last_notice = time.monotonic()
+            if reaped:
+                # Drain available final output before restoring the terminal.
+                while select.select([fd], [], [], 0)[0]:
+                    try:
+                        chunk = os.read(fd, 65536)
+                    except OSError:
+                        break
+                    if not chunk:
+                        break
+                    os.write(sys.stdout.fileno(), chunk)
+                return {"rotate": False, "exit_code": os.waitstatus_to_exitcode(status)}
+            ready, _, _ = select.select([sys.stdin.fileno(), fd], [], [], 0.15)
+            for source in ready:
+                try:
+                    data = os.read(source, 65536)
+                except OSError as exc:
+                    if source == fd and exc.errno == errno.EIO:
+                        continue
+                    raise
+                if not data:
+                    if source == sys.stdin.fileno():
+                        return {"rotate": False, "exit_code": 0}
+                    continue
+                if source == sys.stdin.fileno() and not terminal_response_only(data):
+                    retry.keyboard(data)
+                os.write(fd if source == sys.stdin.fileno() else sys.stdout.fileno(), data)
+            # Process hook receipts and actual keyboard input before considering a
+            # retry. Never type over a user's draft or a still-running task.
+            if retry.due() and not rotation and not session_blocked:
+                if pending_event or os.fstat(events.fileno()).st_size != events.tell():
+                    continue
+                if select.select([sys.stdin.fileno()], [], [], 0)[0]:
+                    continue
+                if retry.can_submit(registry):
+                    os.write(fd, ("\x1b[200~" + retry.prompt + "\x1b[201~\r").encode("utf-8"))
+                    retry.submitted()
+    finally:
+        retry.finish("client-exited")
+        termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, saved)
+        signal.signal(signal.SIGWINCH, prior_winch)
+        if not reaped:
+            terminate_child(pid, fd)
+        os.close(fd)
+
+
+def controller(registry, initial, claude_args):
+    explicit_initial = initial is not None
+    if not sys.stdin.isatty() or not sys.stdout.isatty():
+        raise RuntimeError("自动切换模式需要交互终端；请先 SSH 登录后运行 claude-auto。")
+    prohibited = {"-p", "--print", "--bare", "--safe-mode", "--bg", "--background", "--cloud",
+                  "--settings", "--setting-sources", "--no-session-persistence",
+                  "--dangerously-skip-permissions", "--allow-dangerously-skip-permissions"}
+    if any(a.split("=", 1)[0] in prohibited for a in claude_args):
+        raise RuntimeError("这些参数与交互式续接不兼容；需要它们时请用 claude-accounts use。")
+    persistent_arguments(claude_args)
+    if os.environ.get("CLAUDE_CODE_SKIP_PROMPT_HISTORY", "").lower() in ("1", "true"):
+        raise RuntimeError("自动恢复需要保存会话；请取消 CLAUDE_CODE_SKIP_PROMPT_HISTORY 后重试。")
+    state_dir = ROOT / "state"
+    private_dir(state_dir)
+    if initial is None:
+        preferred = registry.get("default", "main")
+        initial = next((n for n in account_ring(list(registry["profiles"]), preferred)
+                        if not disabled_reason(registry, n)), None)
+        if initial is None:
+            raise RuntimeError("全部账号已停用。")
+    elif reason := disabled_reason(registry, initial):
+        raise RuntimeError(f"账号 {initial} 已停用：{reason}")
+    statuses = {name: auth_status(registry, name) for name in registry["profiles"]}
+    usable = [name for name, status in statuses.items() if eligible(status)]
+    if initial not in usable:
+        raise RuntimeError(f"账号 {initial} 尚未以订阅方式登录；运行 claude-accounts login {initial}。")
+    seen, distinct = set(), []
+    for name in usable:
+        identity = account_identity(statuses[name]) or name
+        if identity not in seen:
+            seen.add(identity)
+            distinct.append(name)
+    if len(distinct) < 2:
+        raise RuntimeError("需要至少两个不同的已登录订阅账号；请运行 claude-accounts setup 配置更多账号。")
+    sync_monitored_recoveries(state_dir)
+    prior_limits = read_quota_state(state_dir)
+    if initial not in distinct:
+        initial = next(name for name in distinct if account_identity(statuses[name]) == account_identity(statuses[initial]))
+    initial_candidates = selection_candidates(registry, distinct, initial, set(), prior_limits)
+    current = initial if explicit_initial and initial in initial_candidates else next(iter(initial_candidates), None)
+    if current is None:
+        say("已登录账号均处于已知的额度等待期；额度恢复后重试。")
+        return 75
+    if current != initial:
+        if prior_limits.get(current, {}).get("source") == "official_usage_recovery":
+            say(f"官方查询已确认 {current} 额度恢复，本窗口优先使用它。")
+        else:
+            say(f"{initial} 额度尚未恢复，本窗口从 {current} 开始。")
+    run_dir = state_dir / "runs" / uuid.uuid4().hex
+    private_dir(run_dir)
+    write_json(run_dir / "launch.json", {"resume_options": persistent_arguments(claude_args), "cwd": os.getcwd(),
+                                        "launcher_version": VERSION, "script_sha256": file_hash(SCRIPT)})
+    requested = requested_session(claude_args)
+    if requested:
+        claim_session(requested, os.getpid())
+    previous_checkpoint = indexed_checkpoint(requested) if requested else None
+    if previous_checkpoint:
+        arm_recovery(run_dir, previous_checkpoint)
+    events_path = run_dir / "events.jsonl"
+    events_path.touch(mode=0o600)
+    args, attempted = claude_args, set()
+    with open(events_path, encoding="utf-8") as events:
+        while True:
+            inherit_preferences(registry, current)
+            settings = overlay_settings(run_dir, current, registry)
+            wait_for_login_refresh(registry, current)
+            say(f"当前账号：{current}。仅在确认订阅额度耗尽后切换；退出 Claude 即退出本启动器。")
+            client_env = profile_env(registry, current)
+            client_env["CLAUDE_ACCOUNTS_CONTROLLER_PID"] = str(os.getpid())
+            client_env["CLAUDE_ACCOUNTS_CLIENT_ID"] = uuid.uuid4().hex
+            outcome = interactive_child([registry["claude"], "--settings", str(settings)] + args,
+                                        client_env, events, current, run_dir, registry)
+            if not outcome["rotate"]:
+                return outcome["exit_code"]
+            attempted.add(current)
+            blocked = limits_blocked_until(outcome["usage"])
+            if blocked <= time.time():
+                blocked = 0
+            prior_limits = record_quota(state_dir, current, blocked)
+            sync_monitored_recoveries(state_dir)
+            prior_limits = read_quota_state(state_dir)
+            # A known window may reset while another account is doing work.
+            attempted = {name for name in attempted if not
+                         (0 < prior_limits.get(name, {}).get("blocked_until", 0) <= time.time())}
+            candidates = selection_candidates(registry, distinct, current, attempted, prior_limits, after=True)
+            next_account = next((name for name in candidates
+                                 if eligible(auth_status(registry, name))), None)
+            if next_account is None:
+                say(f"没有可用的下一账号，已停止。会话已保留：{outcome['session_id']}")
+                say("额度恢复后用 claude-accounts recover " + outcome["session_id"] + " 校验并继续。")
+                return 75
+            say(f"{current} 额度耗尽 → {next_account}，恢复会话 {outcome['session_id']}。")
+            arm_recovery(run_dir, outcome["manifest"])
+            current = next_account
+            args = resume_arguments(claude_args, outcome["session_id"], outcome["manifest"])
+            time.sleep(1)
+
+
+def main(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if argv and argv[0] in ("_hook", "_status"):
+        if len(argv) != 3:
+            return 2
+        native_hook(argv[0], Path(argv[1]), argv[2])
+        return 0
+    parser = argparse.ArgumentParser(description="官方 Claude Code 的本地多账号启动器（无第三方依赖）。")
+    sub = parser.add_subparsers(dest="command", required=True)
+    sub.add_parser("init", help="保留当前 main 账号，准备 second 账号")
+    sub.add_parser("status", help="查看账号登录状态，不显示令牌")
+    disable = sub.add_parser("disable", help="停用账号并让自动切换跳过它")
+    disable.add_argument("name")
+    disable.add_argument("--reason", default="用户手动停用")
+    enable = sub.add_parser("enable", help="显式重新启用账号（确认服务已恢复后使用）")
+    enable.add_argument("name")
+    setup = sub.add_parser("setup", help="按总数准备账号并逐个官方登录；已登录账号自动跳过")
+    setup.add_argument("total", type=int, nargs="?", help="账号总数，包含现有账号；省略则交互输入")
+    add = sub.add_parser("add", help="批量增加独立账号配置")
+    add.add_argument("names", nargs="+")
+    login = sub.add_parser("login", help="通过官方网页逐个授权指定账号")
+    login.add_argument("names", nargs="+")
+    sub.add_parser("login-all", help="继续登录全部尚未完成的位置，已登录账号自动跳过")
+    use = sub.add_parser("use", help="用指定账号运行原版 Claude Code")
+    use.add_argument("name")
+    use.add_argument("args", nargs=argparse.REMAINDER)
+    run = sub.add_parser("run", help="额度耗尽后切换已登录账号，并恢复会话")
+    run.add_argument("--account")
+    run.add_argument("args", nargs=argparse.REMAINDER)
+    recover = sub.add_parser("recover", help="从最近的完整上下文检查点恢复原会话及子代理")
+    recover.add_argument("session_id")
+    recover.add_argument("--account")
+    recovery = sub.add_parser("recovery", help="只读查看原会话的备份与子代理恢复状态")
+    recovery.add_argument("session_id")
+    options = parser.parse_args(argv)
+    registry = init() if options.command == "init" else load_registry()
+    if options.command == "init":
+        say("已准备 main 和 second；现有登录和原版 claude 命令保持可用。")
+    elif options.command in ("disable", "enable"):
+        set_profile_disabled(options.name, options.reason if options.command == "disable" else None)
+        say(f"{options.name} 已停用。" if options.command == "disable" else f"{options.name} 已启用。")
+    elif options.command == "setup":
+        total = options.total
+        if total is None:
+            if not sys.stdin.isatty():
+                raise RuntimeError("请在 SSH 终端运行 setup，或指定账号总数，例如 setup 10。")
+            try:
+                answer = input(f"目前有 {len(registry['profiles'])} 个账号位置。要配置的账号总数（含现有账号，回车保留）： ").strip()
+            except EOFError:
+                raise RuntimeError("未输入总数；已配置的账号保留。") from None
+            total = int(answer) if answer else len(registry["profiles"])
+        names = prepare_profiles(registry, total)
+        return login_profiles(registry, names, skip_existing=True)
+    elif options.command == "add":
+        if any(not NAME.fullmatch(name) or name == "state" for name in options.names):
+            raise RuntimeError("账号名称须以英文字母开头，长度不超过 32，只能包含字母、数字、下划线和短横线。")
+        for name in dict.fromkeys(options.names):
+            path = add_profile(registry, name)
+            say(f"账号目录：{path}")
+        say("下一步 claude-accounts login " + " ".join(dict.fromkeys(options.names)))
+    elif options.command == "status":
+        for name in registry["profiles"]:
+            status = auth_status(registry, name)
+            if status.get("disabled"):
+                print(f"{name:12} 已停用  {status['reason']}")
+                continue
+            print(f"{name:12} " + ("已登录" if eligible(status) else "未登录订阅账号") +
+                  f"  {status.get('subscriptionType') or ''}")
+    elif options.command == "login":
+        return login_profiles(registry, options.names)
+    elif options.command == "login-all":
+        return login_profiles(registry, list(registry["profiles"]), skip_existing=True)
+    elif options.command in ("recover", "recovery"):
+        checkpoint = indexed_checkpoint(options.session_id)
+        if not checkpoint:
+            raise RuntimeError("该会话尚无经过校验的上下文备份。")
+        manifest = verify_checkpoint(checkpoint)
+        if options.command == "recovery":
+            print(json.dumps({"session_id": manifest["session_id"], "checkpoint": str(checkpoint),
+                              "phase": manifest["phase"], "files": len(manifest["files"]),
+                              "agents": manifest["agents"], "pending_tools": manifest["pending_tools"]},
+                             ensure_ascii=False, indent=2))
+            return 0
+        if manifest["pending_tools"]:
+            raise RuntimeError("备份中有未确认结果的工具调用；请先核查其实际执行结果，未自动继续。")
+        if not manifest.get("cwd") or not Path(manifest["cwd"]).is_dir():
+            raise RuntimeError("原工作目录不存在，未自动恢复到其他目录。")
+        claim_session(options.session_id, os.getpid())
+        restored = restore_missing_context(checkpoint, registry)
+        if restored:
+            say(f"已从校验通过的备份恢复 {restored} 个缺失文件；现有文件未覆盖。")
+        os.chdir(manifest["cwd"])
+        return controller(registry, options.account,
+                          manifest["resume_options"] + ["--resume", options.session_id, recovery_prompt(checkpoint)])
+    elif options.command in ("use", "run"):
+        args = options.args[1:] if options.args[:1] == ["--"] else options.args
+        if options.command == "use":
+            if reason := disabled_reason(registry, options.name):
+                raise RuntimeError(f"账号 {options.name} 已停用：{reason}")
+            if not eligible(auth_status(registry, options.name)):
+                raise RuntimeError(f"先运行 claude-accounts login {options.name}。")
+            inherit_preferences(registry, options.name)
+            os.execvpe(registry["claude"], [registry["claude"]] + args,
+                       profile_env(registry, options.name))
+        return controller(registry, options.account, args)
+    return 0
+
+
+if __name__ == "__main__":
+    def stopped(signum, frame):
+        raise KeyboardInterrupt
+    signal.signal(signal.SIGTERM, stopped)
+    signal.signal(signal.SIGHUP, stopped)
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        say("已停止。")
+        sys.exit(130)
+    except (RuntimeError, OSError, ValueError) as exc:
+        say(str(exc))
+        sys.exit(1)

@@ -1,0 +1,18 @@
+[Unit]
+Description=Claude Auto quota dashboard (loopback)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h
+ExecStart=%h/.local/bin/claude-quota --bind 127.0.0.1 --port 8794
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=45
+UMask=0077
+Environment=PYTHONUNBUFFERED=1
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target

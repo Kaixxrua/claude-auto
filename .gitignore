@@ -1,0 +1,26 @@
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.coverage
+htmlcov/
+build/
+dist/
+*.egg-info/
+.DS_Store
+
+# Local profiles, credentials and generated runtime state are never source.
+.env
+.env.*
+!.env.example
+.claude/
+.claude-accounts/
+.credentials.json
+accounts.json
+persistent-watchers.json
+state/
+logs/
+*.log
+*.jsonl
+*.pem
+*.key
