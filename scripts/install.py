@@ -13,6 +13,7 @@ SOURCE = Path(__file__).resolve().parents[1]
 COMMANDS = ('claude-accounts', 'claude-auto', 'claude-quota')
 ASSETS = ('monitor.py', 'reset_cards.py', 'static/index.html',
           'static/app.js', 'static/style.css', 'static/favicon.svg')
+COMPACTION_ASSETS = ('.claude-plugin/plugin.json', 'hooks/hooks.json', 'hooks/register.js')
 
 
 def atomic_install(content: bytes, target: Path, mode: int):
@@ -38,6 +39,11 @@ def install(prefix: Path, systemd: bool = False):
     manifest = [(SOURCE/'bin'/name, prefix/'bin'/name, 0o755) for name in COMMANDS]
     manifest += [(SOURCE/'dashboard'/name, prefix/'share/claude-quota-monitor'/name, 0o644) for name in ASSETS]
     manifest += [(SOURCE/name, prefix/'share/doc/claude-auto'/name, 0o644) for name in ('LICENSE', 'NOTICE')]
+    manifest += [(SOURCE/'plugins/compaction-recovery'/name,
+                  prefix/'share/claude-auto/compaction-recovery'/name, 0o644)
+                 for name in COMPACTION_ASSETS]
+    manifest.append((SOURCE/'plugins/.claude-plugin/marketplace.json',
+                     prefix/'share/claude-auto/.claude-plugin/marketplace.json', 0o644))
     if systemd:
         manifest.append((SOURCE/'examples/claude-quota-monitor.service',
                          Path.home()/'.config/systemd/user/claude-quota-monitor.service', 0o644))

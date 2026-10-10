@@ -24,3 +24,7 @@ logs/
 *.jsonl
 *.pem
 *.key
+
+# Claude Code generates these when inspecting a local mod.
+plugins/**/.claude-plugin/types/
+plugins/**/tsconfig.json

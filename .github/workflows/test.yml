@@ -29,5 +29,7 @@ jobs:
           node --check dashboard/static/app.js
       - name: Unit, PTY, HTTP and clean-install tests (offline fixtures)
         run: python -m unittest discover -s tests -v
+      - name: Compaction recovery tests (offline public API fixtures)
+        run: node --test tests/test_compaction.mjs
       - name: Verify distributable files
         run: python scripts/check_release.py

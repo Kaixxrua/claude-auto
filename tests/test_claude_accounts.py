@@ -988,6 +988,44 @@ class ContextTests(unittest.TestCase):
         result=m.lifecycle_record(self.run,'second',{**wrong,'hook_event_name':'PreToolUse','tool_name':'Bash','tool_use_id':'bad'})
         self.assertEqual(result['hookSpecificOutput']['permissionDecision'],'deny')
 
+    def test_resume_verifies_without_replaying_history_in_deadline_hook(self):
+        m.arm_recovery(self.run,self.checkpoint())
+        before = self.transcript.read_bytes(), self.agent.read_bytes()
+        with mock.patch.object(m,'reconcile_receipts',side_effect=AssertionError('slow history replay')):
+            m.lifecycle_record(self.run,'second',self.payload('SessionStart'))
+            self.assertTrue(m.read_json(self.run/'pending-recovery.json')['verified'])
+            self.assertIsNone(m.lifecycle_record(self.run,'second',self.payload('UserPromptSubmit')))
+            m.lifecycle_record(self.run,'second',self.payload('PreToolUse',tool_name='Read',tool_use_id='read'))
+            m.lifecycle_record(self.run,'second',self.payload('PostToolUse',tool_name='Read',tool_use_id='read'))
+        self.assertEqual(before,(self.transcript.read_bytes(),self.agent.read_bytes()))
+        self.assertFalse(m.read_json(m.session_state_path(self.run,self.sid))['pending_tools'])
+
+    def test_controller_persists_replayed_receipts_and_cursors(self):
+        self.state['pending_tools']={'finished':{'tool_name':'Read'},'running':{'tool_name':'Bash'}}
+        m.write_json(m.session_state_path(self.run,self.sid),self.state)
+        with self.transcript.open('a') as stream:
+            stream.write(json.dumps({'type':'user','message':{'content':[
+                {'type':'tool_result','tool_use_id':'finished','content':'done'}]}})+'\n')
+        self.assertEqual(m.rotation_busy(self.state,self.run)[1],['running'])
+        saved=m.read_json(m.session_state_path(self.run,self.sid))
+        self.assertEqual(list(saved['pending_tools']),['running'])
+        self.assertEqual(saved['receipt_cursors'][str(self.transcript)]['offset'],self.transcript.stat().st_size)
+        with mock.patch.object(m,'native_task_result',side_effect=AssertionError('repeated history replay')):
+            self.assertEqual(m.rotation_busy(saved,self.run)[1],['running'])
+
+    def test_controller_scan_never_overwrites_concurrent_hook(self):
+        m.write_json(m.session_state_path(self.run,self.sid),self.state)
+        original=m.reconcile_receipts
+        def scan(state):
+            original(state)
+            # This hook also proves the scan did not hold the lifecycle lock.
+            m.lifecycle_record(self.run,'main',self.payload('PreToolUse',tool_name='Bash',tool_use_id='new'))
+        with mock.patch.object(m,'reconcile_receipts',side_effect=scan):
+            with self.assertRaises(m.ContextNotReady): m.rotation_busy(self.state,self.run)
+        saved=m.read_json(m.session_state_path(self.run,self.sid))
+        self.assertIn('new',saved['pending_tools'])
+        self.assertEqual(m.rotation_busy(saved,self.run)[1],['new'])
+
     def test_draining_waits_for_inflight_tool_and_does_not_start_new_one(self):
         m.lifecycle_record(self.run,'main',self.payload('PreToolUse',tool_name='Bash',tool_use_id='running'))
         m.write_json(self.run/'draining.json',{'session_id':self.sid})

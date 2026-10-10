@@ -1,0 +1,6 @@
+{
+  "name": "auto-compaction-recovery",
+  "version": "0.1.1",
+  "description": "Bounded retries for failed native compaction and idle recovery of an exceeded configured window.",
+  "author": {"name": "claude-auto contributors"}
+}

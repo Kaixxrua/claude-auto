@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import copy
 import datetime
 import errno
 import hashlib
@@ -31,7 +32,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 ROOT = Path(os.environ.get("CLAUDE_ACCOUNTS_HOME", str(Path.home() / ".claude-accounts")))
 SCRIPT = Path(__file__).resolve()
-VERSION = "2026-10-10.1"
+VERSION = "2026-10-10.3"
 DISABLED_UNTIL = 253402300799
 SHARED = ("settings.json", "settings.local.json", "CLAUDE.md", "projects", "agents",
           "commands", "rules", "skills", "plugins", "output-styles", "keybindings.json")
@@ -584,8 +585,9 @@ def reconcile_receipts(state):
             continue
 
 
-def reconcile_background(state):
-    reconcile_receipts(state)
+def reconcile_background(state, *, read_receipts=True):
+    if read_receipts:
+        reconcile_receipts(state)
     for task in state.get("background_tasks", []):
         if task.get("status") not in ("running", "pending", "external"):
             continue
@@ -641,6 +643,11 @@ def lifecycle_record(run_dir, account, payload):
                 state["client_id"] = client_id
         state["updated_at"] = now
         state["hook_version"] = VERSION
+        compact_window = os.environ.get("CLAUDE_CODE_AUTO_COMPACT_WINDOW", "")
+        if compact_window.isdecimal() and len(compact_window) <= 9:
+            state["compaction_window_env"] = int(compact_window)
+        else:
+            state.pop("compaction_window_env", None)
         for field in ("transcript_path",):
             if payload.get(field):
                 state[field] = payload[field]
@@ -717,7 +724,11 @@ def lifecycle_record(run_dir, account, payload):
                 native_task_result(state, payload.get("tool_response"), now, "native-tool-hook")
         if kind == "SessionEnd":
             state["ended_at"] = now
-        reconcile_background(state)
+        # Resume can replace a transcript inode and invalidate every receipt
+        # cursor. Replaying large histories here exceeds the native hook's
+        # deadline and loses both the state and the recovery verification.
+        # Hooks record native events; the controller scans history before exit.
+        reconcile_background(state, read_receipts=False)
         write_json(path, state)
         if recovery:
             write_json(run_dir / "pending-recovery.json", recovery)
@@ -1466,12 +1477,42 @@ def overlay_settings(run_dir, account, registry):
     return path
 
 
+def compaction_plugin_arguments(binary, profile=None):
+    """Use the supported native mod, when installed beside this launcher."""
+    if os.environ.get("CLAUDE_AUTO_COMPACTION_RECOVERY", "1").lower() in ("0", "false"):
+        return []
+    if profile:
+        installed = read_json(Path(profile) / "plugins/installed_plugins.json", {})
+        if any(name.split("@", 1)[0] == "auto-compaction-recovery"
+               for name in installed.get("plugins", {})):
+            # Let native plugin settings decide whether the installed copy is
+            # enabled. Never load a second inline copy or override its disable.
+            return []
+    prefix = SCRIPT.parent.parent
+    candidates = (prefix / "share/claude-auto/compaction-recovery",
+                  prefix / "plugins/compaction-recovery")
+    plugin = next((p for p in candidates if (p / ".claude-plugin/plugin.json").is_file()), None)
+    if plugin is None:
+        return []
+    try:
+        result = subprocess.run([str(binary), "--version"], capture_output=True,
+                                text=True, timeout=10, check=True)
+        version = re.search(r"\b(\d+)\.(\d+)\.(\d+)\b", result.stdout)
+        if not version or tuple(map(int, version.groups())) < (2, 1, 287):
+            say("压缩恢复插件需要 Claude Code 2.1.287+；本次保留原版压缩行为。")
+            return []
+    except (OSError, subprocess.SubprocessError):
+        say("无法确认原版版本，未加载压缩恢复插件。")
+        return []
+    return ["--plugin-dir", str(plugin)]
+
+
 def persistent_arguments(claude_args):
     """Validate supported options and preserve restrictions across account switches."""
     scalar = {"--model", "--effort", "--permission-mode", "--agent", "--autocompact",
               "--tools", "--allowedTools", "--allowed-tools", "--disallowedTools",
               "--disallowed-tools", "--add-dir", "--mcp-config", "--append-system-prompt",
-              "--system-prompt", "--name", "-n", "--fallback-model"}
+              "--system-prompt", "--name", "-n", "--fallback-model", "--plugin-dir"}
     simple = {"--verbose", "--ax-screen-reader", "--no-chrome", "--chrome", "--ide",
               "--strict-mcp-config"}
     initial_only = {"--session-id"}
@@ -1540,8 +1581,18 @@ def terminate_child(pid, fd, timeout=30):
     return False
 
 
-def rotation_busy(state):
+def rotation_busy(state, run_dir=None):
+    before = copy.deepcopy(state) if run_dir is not None else None
     reconcile_background(state)
+    if run_dir is not None:
+        # Scan outside the lifecycle lock so hooks remain responsive. Persist
+        # cursors only if no hook changed the snapshot while it was scanned.
+        path = session_state_path(run_dir, state["session_id"])
+        with state_lock(run_dir / "lifecycle.lock"):
+            if read_json(path, {}) != before:
+                raise ContextNotReady("扫描期间工具状态已更新，等待下一次核对。")
+            if state != before:
+                write_json(path, state)
     running = [key for key, value in state.get("agents", {}).items() if value.get("state") == "running"]
     tools = list(state.get("pending_tools", {}))
     background = [task for task in state.get("background_tasks", []) if task.get("status") in ("running", "pending")]
@@ -1858,7 +1909,7 @@ def interactive_child(command, env, events, account, run_dir, registry):
                         say("上下文校验通过：" + str(final_checkpoint))
                         return rotation
                     if not shutdown_requested:
-                        running, tools, background = rotation_busy(state)
+                        running, tools, background = rotation_busy(state, run_dir)
                         if running or tools or background:
                             raise ContextNotReady(f"仍有 {len(running)} 个子代理、{len(tools)} 个工具调用、{len(background)} 个后台任务未结束；保留进程等待。")
                         _, sources = context_sources(registry, state)
@@ -2001,13 +2052,14 @@ def controller(registry, initial, claude_args):
     with open(events_path, encoding="utf-8") as events:
         while True:
             inherit_preferences(registry, current)
+            compaction_args = compaction_plugin_arguments(registry["claude"], registry["profiles"][current])
             settings = overlay_settings(run_dir, current, registry)
             wait_for_login_refresh(registry, current)
             say(f"当前账号：{current}。仅在确认订阅额度耗尽后切换；退出 Claude 即退出本启动器。")
             client_env = profile_env(registry, current)
             client_env["CLAUDE_ACCOUNTS_CONTROLLER_PID"] = str(os.getpid())
             client_env["CLAUDE_ACCOUNTS_CLIENT_ID"] = uuid.uuid4().hex
-            outcome = interactive_child([registry["claude"], "--settings", str(settings)] + args,
+            outcome = interactive_child([registry["claude"]] + compaction_args + ["--settings", str(settings)] + args,
                                         client_env, events, current, run_dir, registry)
             if not outcome["rotate"]:
                 return outcome["exit_code"]
