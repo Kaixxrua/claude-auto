@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- Avoid rewriting existing context objects and reuse process-local verification proofs for unchanged files during account rotation. Keep full history, final flushes and original agent identifiers; inode, device, mode, size, mtime or ctime changes invalidate cached proofs.
+- Reuse validated subagent terminal status instead of reparsing unchanged histories, and extend an already verified prefix hash when the file remains unchanged.
+- Report checkpoint progress, reuse/write counts and private rotation phase timings. First verification in a new process still reads file contents.
+
+Launcher implementation version: `2026-10-10.1`.
+
 ## 0.1.0 — 2026-10-09
 
 Initial public release of the local launcher and quota dashboard.
