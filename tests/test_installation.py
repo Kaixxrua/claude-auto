@@ -67,6 +67,10 @@ class InstallationTests(unittest.TestCase):
     def test_install_init_upgrade_preserves_private_data_and_native_binary(self):
         self.install()
         self.assertFalse(self.runtime.exists(), 'install must not initialize accounts')
+        plugin = self.prefix/'share/claude-auto/compaction-recovery'
+        self.assertEqual(json.loads((plugin/'.claude-plugin/plugin.json').read_text())['name'],
+                         'auto-compaction-recovery')
+        self.assertTrue((plugin/'hooks/register.js').is_file())
         for command in ('claude-auto', 'claude-accounts', 'claude-quota'):
             self.command(self.prefix/'bin'/command, '--help')
         self.command(self.prefix/'bin/claude-accounts', 'init')

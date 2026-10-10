@@ -1,12 +1,13 @@
 # Contributing
 
-Use Linux with Python 3.10+ and the system timezone database. Runtime code uses the standard library. Node.js is needed only for JavaScript syntax checks. Tests do not require Claude Code, a subscription, or external credentials.
+Use Linux with Python 3.10+ and the system timezone database. The launcher and dashboard use the standard library; the optional compaction mod runs inside Claude Code. Node.js is needed for JavaScript checks and mod tests. Automated tests do not require Claude Code, a subscription, or external credentials.
 
 ```bash
 python3 -m unittest discover -s tests -v
 python3 -m py_compile bin/claude-accounts dashboard/monitor.py dashboard/reset_cards.py scripts/install.py
 sh -n bin/claude-auto bin/claude-quota
 node --check dashboard/static/app.js
+node --test tests/test_compaction.mjs
 python3 scripts/check_release.py
 ```
 

@@ -6,6 +6,8 @@ A local account launcher and quota dashboard for Claude Code. After a confirmed 
 
 Independent community project. The official Claude Code client is neither bundled nor modified. Use only accounts you are authorized to access; provider limits, permissions, and terms still apply.
 
+Claude Code 2.1.287+ also supports bounded recovery from failed compaction in main sessions and subagents, plus idle recovery of an exceeded main-session window. See [activation and limitations](docs/compaction.md).
+
 ![Quota dashboard with fictional accounts and sample usage](docs/dashboard.png)
 
 *All accounts, email addresses, and usage values in this screenshot are fictional.*

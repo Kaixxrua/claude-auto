@@ -1,0 +1,10 @@
+{
+  "name": "auto-account-tools",
+  "owner": {"name": "claude-auto contributors"},
+  "metadata": {"description": "Local recovery tools for the claude-auto launcher."},
+  "plugins": [{
+    "name": "auto-compaction-recovery",
+    "source": "./compaction-recovery",
+    "description": "Recover from transient native compaction failures."
+  }]
+}

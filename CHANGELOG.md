@@ -6,7 +6,10 @@
 - Reuse validated subagent terminal status instead of reparsing unchanged histories, and extend an already verified prefix hash when the file remains unchanged.
 - Report checkpoint progress, reuse/write counts and private rotation phase timings. First verification in a new process still reads file contents.
 
-Launcher implementation version: `2026-10-10.1`.
+- Add an official Claude Code mod with bounded retries for native main/subagent compaction failures and idle recovery after an explicit main-session window is exceeded. Preserve cancellation, hook vetoes, native history and quota rotation. See `docs/compaction.md` for activation and limits.
+- Keep large transcript receipt scans outside lifecycle hooks, allowing resume verification to finish within the native hook deadline. Rotation still reconciles missing receipts and saves scan cursors without overwriting concurrent hook updates.
+
+Launcher implementation version: `2026-10-10.3`.
 
 ## 0.1.0 — 2026-10-09
 
