@@ -32,7 +32,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 ROOT = Path(os.environ.get("CLAUDE_ACCOUNTS_HOME", str(Path.home() / ".claude-accounts")))
 SCRIPT = Path(__file__).resolve()
-VERSION = "2026-10-10.3"
+VERSION = "2026-10-10.4"
 DISABLED_UNTIL = 253402300799
 SHARED = ("settings.json", "settings.local.json", "CLAUDE.md", "projects", "agents",
           "commands", "rules", "skills", "plugins", "output-styles", "keybindings.json")
@@ -202,13 +202,17 @@ def profile_env(registry, name):
         env.pop("CLAUDE_CONFIG_DIR", None)
     else:
         env["CLAUDE_CONFIG_DIR"] = str(directory)
-    # Native 2.1.295 can wait 3 minutes for response headers, then escalate to
-    # 10 minutes on its next attempt. Idle proxy connections reproduced this
-    # stall. Bound the native request wait; the native client owns retries.
-    # Preserve an explicit operator timeout and leave direct connections alone.
+    # The native first-byte deadline is capped at API_TIMEOUT_MS minus 1s,
+    # including its retry. A 60s request cap therefore rejects delayed proxy
+    # responses at 59s twice, regardless of a more generous first-byte setting.
+    # Give large requests time to start, while bounding the escalated retry.
+    # If the operator sets either timeout, let native code resolve the pair;
+    # injecting the other could silently cap their explicitly longer wait.
     if any(env.get(key) for key in ("HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY",
-                                    "https_proxy", "http_proxy", "all_proxy")):
-        env.setdefault("API_TIMEOUT_MS", "60000")
+                                    "https_proxy", "http_proxy", "all_proxy")) and not any(
+            key in env for key in ("API_TIMEOUT_MS", "CLAUDE_STREAM_FIRST_BYTE_TIMEOUT_MS")):
+        env["API_TIMEOUT_MS"] = "300000"
+        env["CLAUDE_STREAM_FIRST_BYTE_TIMEOUT_MS"] = "180000"
     return env
 
 
@@ -648,6 +652,10 @@ def lifecycle_record(run_dir, account, payload):
             state["compaction_window_env"] = int(compact_window)
         else:
             state.pop("compaction_window_env", None)
+        state["network_timeouts_env"] = {
+            key: int(value) for key in ("API_TIMEOUT_MS", "CLAUDE_STREAM_FIRST_BYTE_TIMEOUT_MS")
+            if (value := os.environ.get(key, "")).isdecimal() and len(value) <= 10
+            and 0 < int(value) <= 2147483647}
         for field in ("transcript_path",):
             if payload.get(field):
                 state[field] = payload[field]

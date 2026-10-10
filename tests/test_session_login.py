@@ -228,23 +228,50 @@ class ProxyTimeoutTests(unittest.TestCase):
 
     def test_proxy_gets_bounded_native_timeout(self):
         with mock.patch.dict(os.environ, {'HTTPS_PROXY': 'http://127.0.0.1:17898'}, clear=True):
-            self.assertEqual(m.profile_env(self.registry, 'second')['API_TIMEOUT_MS'], '60000')
+            env = m.profile_env(self.registry, 'second')
+            self.assertEqual(env['API_TIMEOUT_MS'], '300000')
+            self.assertEqual(env['CLAUDE_STREAM_FIRST_BYTE_TIMEOUT_MS'], '180000')
+            self.assertNotIn('API_TIMEOUT_MS', os.environ)
 
     def test_lowercase_proxy_is_supported(self):
-        with mock.patch.dict(os.environ, {'https_proxy': 'http://127.0.0.1:17898'}, clear=True):
-            self.assertEqual(m.profile_env(self.registry, 'second')['API_TIMEOUT_MS'], '60000')
+        for key in ('https_proxy', 'http_proxy', 'all_proxy'):
+            with self.subTest(key=key), mock.patch.dict(os.environ, {key: 'http://127.0.0.1:17898'}, clear=True):
+                env = m.profile_env(self.registry, 'second')
+                self.assertEqual(env['API_TIMEOUT_MS'], '300000')
+                self.assertEqual(env['CLAUDE_STREAM_FIRST_BYTE_TIMEOUT_MS'], '180000')
 
     def test_all_proxy_is_supported(self):
-        with mock.patch.dict(os.environ, {'ALL_PROXY': 'socks5://127.0.0.1:17898'}, clear=True):
-            self.assertEqual(m.profile_env(self.registry, 'second')['API_TIMEOUT_MS'], '60000')
+        for key in ('HTTP_PROXY', 'ALL_PROXY'):
+            with self.subTest(key=key), mock.patch.dict(os.environ, {key: 'http://127.0.0.1:17898'}, clear=True):
+                self.assertEqual(m.profile_env(self.registry, 'second')['API_TIMEOUT_MS'], '300000')
 
     def test_explicit_operator_timeout_is_preserved(self):
-        with mock.patch.dict(os.environ, {'HTTPS_PROXY': 'http://localhost:17898', 'API_TIMEOUT_MS': '120000'}, clear=True):
-            self.assertEqual(m.profile_env(self.registry, 'second')['API_TIMEOUT_MS'], '120000')
+        for value in ('120000', '900000', ''):
+            with self.subTest(value=value), mock.patch.dict(os.environ,
+                    {'HTTPS_PROXY': 'http://localhost:17898', 'API_TIMEOUT_MS': value}, clear=True):
+                env = m.profile_env(self.registry, 'second')
+                self.assertEqual(env['API_TIMEOUT_MS'], value)
+                self.assertNotIn('CLAUDE_STREAM_FIRST_BYTE_TIMEOUT_MS', env)
+
+    def test_explicit_first_byte_is_not_capped_by_an_injected_request_timeout(self):
+        with mock.patch.dict(os.environ, {'HTTPS_PROXY': 'http://localhost:17898',
+                'CLAUDE_STREAM_FIRST_BYTE_TIMEOUT_MS': '600000'}, clear=True):
+            env = m.profile_env(self.registry, 'second')
+        self.assertEqual(env['CLAUDE_STREAM_FIRST_BYTE_TIMEOUT_MS'], '600000')
+        self.assertNotIn('API_TIMEOUT_MS', env)
+
+    def test_explicit_timeout_pair_is_preserved(self):
+        with mock.patch.dict(os.environ, {'HTTPS_PROXY': 'http://localhost:17898',
+                'API_TIMEOUT_MS': '700000', 'CLAUDE_STREAM_FIRST_BYTE_TIMEOUT_MS': '400000'}, clear=True):
+            env = m.profile_env(self.registry, 'second')
+        self.assertEqual(env['API_TIMEOUT_MS'], '700000')
+        self.assertEqual(env['CLAUDE_STREAM_FIRST_BYTE_TIMEOUT_MS'], '400000')
 
     def test_direct_connection_is_unchanged(self):
         with mock.patch.dict(os.environ, {}, clear=True):
-            self.assertNotIn('API_TIMEOUT_MS', m.profile_env(self.registry, 'second'))
+            env = m.profile_env(self.registry, 'second')
+            self.assertNotIn('API_TIMEOUT_MS', env)
+            self.assertNotIn('CLAUDE_STREAM_FIRST_BYTE_TIMEOUT_MS', env)
 
     def test_disabled_account_cannot_get_an_environment(self):
         m.write_json(self.root / 'accounts.json', {**self.registry, 'disabled': {'second': {'reason': 'banned'}}})

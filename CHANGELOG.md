@@ -9,7 +9,9 @@
 - Add an official Claude Code mod with bounded retries for native main/subagent compaction failures and idle recovery after an explicit main-session window is exceeded. Preserve cancellation, hook vetoes, native history and quota rotation. See `docs/compaction.md` for activation and limits.
 - Keep large transcript receipt scans outside lifecycle hooks, allowing resume verification to finish within the native hook deadline. Rotation still reconciles missing receipts and saves scan cursors without overwriting concurrent hook updates.
 
-Launcher implementation version: `2026-10-10.3`.
+- Replace the proxy-only 60-second request cap with a 5-minute request budget and a 3-minute first-response baseline. Preserve explicit operator settings and native retry/stream watchdog behavior; record numeric timeout settings in private lifecycle diagnostics.
+
+Launcher implementation version: `2026-10-10.4`.
 
 ## 0.1.0 — 2026-10-09
 
