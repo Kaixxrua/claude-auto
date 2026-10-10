@@ -31,7 +31,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 ROOT = Path(os.environ.get("CLAUDE_ACCOUNTS_HOME", str(Path.home() / ".claude-accounts")))
 SCRIPT = Path(__file__).resolve()
-VERSION = "2026-10-09.2"
+VERSION = "2026-10-10.1"
 DISABLED_UNTIL = 253402300799
 SHARED = ("settings.json", "settings.local.json", "CLAUDE.md", "projects", "agents",
           "commands", "rules", "skills", "plugins", "output-styles", "keybindings.json")
@@ -831,86 +831,162 @@ def file_signature(sources):
     result = []
     for path in sorted(sources):
         info = path.lstat()
-        result.append((str(path), info.st_mode, info.st_ino, info.st_size, info.st_mtime_ns,
+        result.append((str(path), info.st_mode, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns, info.st_dev,
                        os.readlink(path) if stat.S_ISLNK(info.st_mode) else None))
     return tuple(result)
 
 
-def archive_file(source, archive_root, allow_symlink=False, allow_historical_errors=False):
-    before = source.lstat()
-    link = stat.S_ISLNK(before.st_mode)
+# These caches are deliberately process-local: a new controller verifies bytes
+# again. ctime catches same-size rewrites even when mtime has been restored.
+_CONTEXT_HASHES = {}
+_CONTEXT_ARCHIVES = {}
+
+
+def context_stamp(path):
+    info = path.lstat()
+    return (info.st_dev, info.st_ino, info.st_mode, info.st_size,
+            info.st_mtime_ns, info.st_ctime_ns)
+
+
+def context_hash(path, limit=None):
+    before = context_stamp(path)
+    if not stat.S_ISREG(before[2]):
+        raise ContextNotReady("上下文校验对象不是普通文件：" + str(path))
+    length = before[3] if limit is None else limit
+    if length < 0 or length > before[3]:
+        raise ContextNotReady("上下文长度不足，无法校验：" + str(path))
+    key = str(path.absolute())
+    cached = _CONTEXT_HASHES.get(key, {})
+    states = cached.get("states", {}) if cached.get("stamp") == before else {}
+    if length in states:
+        return states[length].hexdigest()
+    # The post-exit prefix check can seed the following full-file hash: resume
+    # that exact hash state only while the entire file's identity is unchanged.
+    offset = max((n for n in states if n < length), default=0)
+    digest = states[offset].copy() if offset in states else hashlib.sha256()
+    with os.fdopen(os.open(path, os.O_RDONLY | os.O_NOFOLLOW), "rb") as stream:
+        stream.seek(offset)
+        remaining = length - offset
+        while remaining:
+            chunk = stream.read(min(1024 * 1024, remaining))
+            if not chunk:
+                raise ContextNotReady("上下文在校验时被截断：" + str(path))
+            digest.update(chunk)
+            remaining -= len(chunk)
+        info = os.fstat(stream.fileno())
+        opened = (info.st_dev, info.st_ino, info.st_mode, info.st_size,
+                  info.st_mtime_ns, info.st_ctime_ns)
+    if opened != before or context_stamp(path) != before:
+        raise ContextNotReady("上下文仍在写入，稍后重新校验：" + str(path))
+    if len(_CONTEXT_HASHES) >= 100000:
+        _CONTEXT_HASHES.clear()
+    states = dict(states)
+    if len(states) >= 8:
+        states.clear()
+    states[length] = digest.copy()
+    _CONTEXT_HASHES[key] = {"stamp": before, "states": states}
+    return digest.hexdigest()
+
+
+def archive_file(source, archive_root, allow_symlink=False, allow_historical_errors=False, stats=None):
+    before = context_stamp(source)
+    link = stat.S_ISLNK(before[2])
     if link and not allow_symlink:
         raise ContextNotReady("上下文记录不可为符号链接：" + str(source))
-    if not link and not stat.S_ISREG(before.st_mode):
+    if not link and not stat.S_ISREG(before[2]):
         raise ContextNotReady("上下文不是普通文件：" + str(source))
-    link_text = os.readlink(source) if link else None
-    private_dir(archive_root / "objects")
-    fd, temporary = tempfile.mkstemp(prefix=".object-", dir=archive_root / "objects")
-    digest = hashlib.sha256()
-    size, last = 0, b""
-    warnings, warning_count = [], 0
-    try:
-        with os.fdopen(fd, "wb") as outgoing:
-            if link:
-                chunk = os.fsencode(link_text)
-                outgoing.write(chunk)
-                digest.update(chunk)
-                size = len(chunk)
-            else:
-                with os.fdopen(os.open(source, os.O_RDONLY | os.O_NOFOLLOW), "rb") as incoming:
-                    while chunk := incoming.read(1024 * 1024):
-                        outgoing.write(chunk)
-                        digest.update(chunk)
-                        size += len(chunk)
-                        last = chunk[-1:]
-            outgoing.flush()
-            os.fsync(outgoing.fileno())
-        after = source.lstat()
-        if ((before.st_mode, before.st_ino, before.st_size, before.st_mtime_ns)
-                != (after.st_mode, after.st_ino, after.st_size, after.st_mtime_ns) or size != before.st_size
-                or (link and os.readlink(source) != link_text)):
+    cache_key = (str(archive_root.absolute()), str(source.absolute()), allow_symlink, allow_historical_errors)
+    cached = _CONTEXT_ARCHIVES.get(cache_key)
+    if cached and cached[0] == before:
+        item = cached[1]
+        target = archive_root / "objects" / item["sha256"]
+        if (not target.is_file() or target.is_symlink() or target.stat().st_size != item["size"]
+                or context_hash(target) != item["sha256"]):
+            raise ContextNotReady("已有上下文备份校验失败，停止切号。")
+        if context_stamp(source) != before:
             raise ContextNotReady("上下文仍在写入，稍后重新保存：" + str(source))
-        if not link and source.suffix == ".jsonl" and size and last != b"\n":
-            raise ContextNotReady("上下文最后一条记录尚未写完整：" + source.name)
-        if not link and source.suffix == ".jsonl":
-            valid, last_invalid, offset = 0, False, 0
-            with open(temporary, "rb") as stream:
-                for number, line in enumerate(stream, 1):
-                    try:
-                        json.loads(line)
-                        valid += 1
-                        last_invalid = False
-                    except (ValueError, UnicodeError) as exc:
-                        if not allow_historical_errors:
-                            raise ContextNotReady("上下文包含不完整的 JSON 记录：" + source.name) from None
-                        warning_count += 1
-                        last_invalid = True
-                        if len(warnings) < 20:
-                            warnings.append({"line": number, "offset": offset, "bytes": len(line),
-                                             "error": type(exc).__name__})
-                    offset += len(line)
-            # Preserve a pre-existing damaged interior row byte-for-byte. The
-            # official client already resumes such histories; no row is dropped
-            # or rewritten. An unfinished/damaged final row must still settle.
-            if warning_count and (last_invalid or not valid):
-                raise ContextNotReady("上下文末尾记录尚未通过 JSON 校验：" + source.name)
-        key = digest.hexdigest()
-        target = archive_root / "objects" / key
-        if target.exists():
-            if file_hash(target) != key:
-                raise ContextNotReady("已有上下文备份校验失败，停止切号。")
-        else:
+        if stats is not None:
+            stats["reused_files"] += 1
+            stats["reused_bytes"] += item["size"]
+        return dict(item)
+    link_text = os.readlink(source) if link else None
+    size = len(os.fsencode(link_text)) if link else before[3]
+    key = hashlib.sha256(os.fsencode(link_text)).hexdigest() if link else context_hash(source)
+    private_dir(archive_root / "objects")
+    target = archive_root / "objects" / key
+    if target.exists() or target.is_symlink():
+        if target.is_symlink() or not target.is_file() or target.stat().st_size != size or context_hash(target) != key:
+            raise ContextNotReady("已有上下文备份校验失败，停止切号。")
+        if stats is not None:
+            stats["existing_objects"] += 1
+    else:
+        fd, temporary = tempfile.mkstemp(prefix=".object-", dir=target.parent)
+        copied = hashlib.sha256()
+        try:
+            with os.fdopen(fd, "wb") as outgoing:
+                if link:
+                    chunk = os.fsencode(link_text)
+                    outgoing.write(chunk)
+                    copied.update(chunk)
+                else:
+                    with os.fdopen(os.open(source, os.O_RDONLY | os.O_NOFOLLOW), "rb") as incoming:
+                        while chunk := incoming.read(1024 * 1024):
+                            outgoing.write(chunk)
+                            copied.update(chunk)
+                outgoing.flush()
+                os.fsync(outgoing.fileno())
+            if copied.hexdigest() != key or context_stamp(source) != before:
+                raise ContextNotReady("上下文仍在写入，稍后重新保存：" + str(source))
             os.replace(temporary, target)
             sync_directory(target.parent)
-        item = {"source": str(source), "sha256": key, "size": size}
-        if warning_count:
-            item.update(historical_json_errors=warning_count, historical_json_error_samples=warnings)
-        if link:
-            item.update(kind="symlink", link_target=link_text)
-        return item
-    finally:
-        with contextlib.suppress(FileNotFoundError):
-            os.unlink(temporary)
+            # Read back each newly written object once before caching its proof.
+            if context_hash(target) != key:
+                raise ContextNotReady("上下文备份写入后校验失败，停止切号。")
+            if stats is not None:
+                stats["written_bytes"] += size
+        finally:
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(temporary)
+    warnings, warning_count, last_failure = [], 0, None
+    if not link and source.suffix == ".jsonl":
+        valid, last_invalid, offset = 0, False, 0
+        with target.open("rb") as stream:
+            if size:
+                stream.seek(-1, os.SEEK_END)
+                if stream.read(1) != b"\n":
+                    raise ContextNotReady("上下文最后一条记录尚未写完整：" + source.name)
+                stream.seek(0)
+            for number, line in enumerate(stream, 1):
+                try:
+                    row = json.loads(line)
+                    valid += 1
+                    last_invalid = False
+                    if isinstance(row, dict) and row.get("type") == "assistant":
+                        last_failure = ("blocked" if safety_stop(row) else "failed") if row.get("isApiErrorMessage") else None
+                except (ValueError, UnicodeError) as exc:
+                    if not allow_historical_errors:
+                        raise ContextNotReady("上下文包含不完整的 JSON 记录：" + source.name) from None
+                    warning_count += 1
+                    last_invalid = True
+                    if len(warnings) < 20:
+                        warnings.append({"line": number, "offset": offset, "bytes": len(line),
+                                         "error": type(exc).__name__})
+                offset += len(line)
+        if warning_count and (last_invalid or not valid):
+            raise ContextNotReady("上下文末尾记录尚未通过 JSON 校验：" + source.name)
+    if context_stamp(source) != before or size != before[3] or (link and os.readlink(source) != link_text):
+        raise ContextNotReady("上下文仍在写入，稍后重新保存：" + str(source))
+    item = {"source": str(source), "sha256": key, "size": size}
+    if warning_count:
+        item.update(historical_json_errors=warning_count, historical_json_error_samples=warnings)
+    if last_failure:
+        item["last_assistant_failure"] = last_failure
+    if link:
+        item.update(kind="symlink", link_target=link_text)
+    if len(_CONTEXT_ARCHIVES) >= 100000:
+        _CONTEXT_ARCHIVES.clear()
+    _CONTEXT_ARCHIVES[cache_key] = (before, dict(item))
+    return item
 
 
 def file_hash(path, limit=None):
@@ -928,6 +1004,7 @@ def file_hash(path, limit=None):
 
 
 def checkpoint_context(registry, state, run_dir, phase):
+    started = time.monotonic()
     reconcile_untracked_hooks(state)
     reconcile_background(state)
     transcript, sources = context_sources(registry, state)
@@ -936,9 +1013,15 @@ def checkpoint_context(registry, state, run_dir, phase):
         sources[journal] = "hook-journal"
     signature = file_signature(sources)
     archive_root = ROOT / "state" / "context-archive"
-    items = [{**archive_file(path, archive_root, allow_symlink=role == "scratchpad",
-                            allow_historical_errors=role == "main"), "role": role}
-             for path, role in sorted(sources.items())]
+    stats = {"reused_files": 0, "reused_bytes": 0, "existing_objects": 0, "written_bytes": 0}
+    items, noticed = [], started
+    for path, role in sorted(sources.items()):
+        items.append({**archive_file(path, archive_root, allow_symlink=role == "scratchpad",
+                                    allow_historical_errors=role == "main", stats=stats), "role": role})
+        if time.monotonic() - noticed >= 5:
+            say(f"上下文保存 {len(items)}/{len(sources)} 个文件；复用 {stats['reused_files']} 个未变化文件，新增写入 {stats['written_bytes'] / 1024**2:.1f} MiB。")
+            noticed = time.monotonic()
+    archived_items = {item["source"]: item for item in items}
     if signature != file_signature(sources):
         raise ContextNotReady("保存期间上下文有变化，将重新保存。")
     agents = {}
@@ -950,20 +1033,13 @@ def checkpoint_context(registry, state, run_dir, phase):
         known = state.get("agents", {}).get(agent_id, {})
         agents[agent_id] = {"agent_type": known.get("agent_type") or meta.get("agentType", "unknown"),
                             "state": known.get("state", "historical-unknown"), "transcript_path": str(path)}
-        last_assistant = None
-        with path.open(encoding="utf-8") as stream:
-            for line in stream:
-                try:
-                    row = json.loads(line)
-                except ValueError:
-                    raise ContextNotReady("子代理记录格式不完整：" + path.name) from None
-                if row.get("type") == "assistant":
-                    last_assistant = row
-        if last_assistant and last_assistant.get("isApiErrorMessage"):
-            agents[agent_id]["state"] = "blocked" if safety_stop(last_assistant) else "failed"
+        failure = archived_items[str(path)].get("last_assistant_failure")
+        if failure:
+            agents[agent_id]["state"] = failure
     launch = read_json(run_dir / "launch.json") or read_json(run_dir / "legacy-launch.json", {})
     manifest = {"version": 1, "session_id": state["session_id"], "created_at": time.time(),
-                "phase": phase, "transcript_path": str(transcript), "cwd": launch.get("cwd") or state.get("cwd"),
+                "phase": phase, "checkpoint_stats": {**stats, "archive_seconds": round(time.monotonic() - started, 3)},
+                "transcript_path": str(transcript), "cwd": launch.get("cwd") or state.get("cwd"),
                 "resume_options": launch.get("resume_options", []),
                 "files": items, "agents": agents, "pending_tools": state.get("pending_tools", {}),
                 "unattributed_events": state.get("unattributed_events", {}),
@@ -985,7 +1061,7 @@ def verify_checkpoint(path, live=False):
         raise ContextNotReady("无法读取上下文备份清单。")
     for item in manifest["files"]:
         backup = archive_root / "objects" / item["sha256"]
-        if not backup.is_file() or backup.stat().st_size != item["size"] or file_hash(backup) != item["sha256"]:
+        if not backup.is_file() or backup.stat().st_size != item["size"] or context_hash(backup) != item["sha256"]:
             raise ContextNotReady("上下文备份损坏或缺失：" + item["source"])
         if item.get("kind") == "symlink":
             source = Path(item["source"])
@@ -1003,7 +1079,7 @@ def verify_checkpoint(path, live=False):
             raise ContextNotReady("未知上下文备份类型。")
         if live and item["role"] != "hook-journal":
             source = Path(item["source"])
-            if source.is_symlink() or not source.is_file() or source.stat().st_size < item["size"] or file_hash(source, item["size"]) != item["sha256"]:
+            if source.is_symlink() or not source.is_file() or source.stat().st_size < item["size"] or context_hash(source, item["size"]) != item["sha256"]:
                 raise ContextNotReady("原上下文已缺失或被改写，未启动恢复：" + item["source"])
     return manifest
 
@@ -1036,7 +1112,7 @@ def restore_missing_context(path, registry):
             if not target.is_symlink() or os.readlink(target) != item["link_target"]:
                 raise ContextNotReady("现有链接与备份冲突，未覆盖：" + str(target))
         elif target.exists():
-            if not target.is_file() or target.stat().st_size < item["size"] or file_hash(target, item["size"]) != item["sha256"]:
+            if not target.is_file() or target.stat().st_size < item["size"] or context_hash(target, item["size"]) != item["sha256"]:
                 raise ContextNotReady("现有记录与备份冲突，未覆盖：" + str(target))
         else:
             missing.append(item)
@@ -1705,9 +1781,10 @@ def interactive_child(command, env, events, account, run_dir, registry):
                           allow_user_prompts=True)
 
     def rotation_status(phase, **details):
-        write_json(run_dir / "rotation-status.json", {
-            "at": time.time(), "account": account, "session_id": session_id,
-            "phase": phase, **details})
+        value = {"at": time.time(), "account": account, "session_id": session_id,
+                 "phase": phase, **details}
+        write_json(run_dir / "rotation-status.json", value)
+        append_record(run_dir / "rotation-timings.jsonl", value)
 
     def resize(*_):
         with contextlib.suppress(OSError):

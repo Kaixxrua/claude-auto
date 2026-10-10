@@ -16,6 +16,8 @@ Host validation, same-origin JSON POST requirements, response security headers, 
 - The application has no telemetry collector. Ordinary quota probes use the official CLI; reset-card queries/redemption make the documented-in-source upstream requests. Your existing CLI configuration, plugins and proxy settings continue to apply to your work sessions.
 - A reset-card use requires short-lived confirmation, identity/eligibility checks, and a persisted one-shot operation. Ambiguous upstream outcomes are not automatically retried, even after restart.
 
+Checkpoint verification can reuse process-local SHA-256 proofs while the file's device, inode, type/mode, size, mtime and ctime remain unchanged. Rewrites with a restored mtime, replacement, truncation and symlink substitution invalidate this proof. The cache depends on local filesystem change metadata; it is not a detector for silent storage corruption that leaves all metadata unchanged. A fresh controller re-reads the bytes. Proofs are not loaded from a persistent cache, and changed/new content is hashed and validated before recovery.
+
 ## Supported releases and reporting
 
 Security fixes target the latest release on `main`. Compatibility with undocumented upstream endpoints is best effort.
