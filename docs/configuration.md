@@ -62,7 +62,9 @@ claude-quota --bind 192.168.1.5 --port 8794
 
 ## 代理与登录
 
-子进程继承当前环境的 `HTTPS_PROXY` / `HTTP_PROXY` / `ALL_PROXY` 及小写形式。设置代理后，未显式指定的 `API_TIMEOUT_MS` 默认取 `60000`。systemd 用户服务不一定继承终端环境，按需要在服务 override 中单独配置。
+子进程继承当前环境的 `HTTPS_PROXY` / `HTTP_PROXY` / `ALL_PROXY` 及小写形式。配置代理且未显式指定任一超时时，默认设置 `API_TIMEOUT_MS=300000`（5 分钟请求预算）和 `CLAUDE_STREAM_FIRST_BYTE_TIMEOUT_MS=180000`（3 分钟首响应基准）。原版还会为大请求增加上传时间，并把首次等待和无响应后的重试限制在请求预算以内。
+
+若环境中已设置上述任一变量，启动器保留原值，另一项交由原版解析，避免隐式上限截断显式配置。直连保持原版默认值。已有窗口可在共享用户 `settings.json` 的 `env` 中设置这两个变量，让后续请求使用新配置；已发出的请求保留原来的计时器。systemd 用户服务不一定继承终端环境，按需要在服务 override 中单独配置。
 
 订阅模式会拒绝影响认证来源的环境变量，例如 `ANTHROPIC_API_KEY`、`ANTHROPIC_AUTH_TOKEN`、`CLAUDE_CODE_OAUTH_TOKEN`、`ANTHROPIC_PROFILE` 和云供应商模式开关。在当前终端明确取消这些覆盖后，再使用官方登录流程。
 
