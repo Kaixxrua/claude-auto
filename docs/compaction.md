@@ -1,30 +1,48 @@
-# 压缩失败恢复
+# 原版压缩与状态记录
 
-Claude Code 2.1.296 的原版自动压缩在连续三次失败后，会停止该轮后续尝试；工具循环仍可能继续，因此配置 272K 不代表上下文一定小于 272K。网络、额度、摘要失败和一次较大的工具结果，也会影响压缩时机。不要把状态栏相对模型总窗口的百分比当成相对压缩窗口的百分比。
+`auto-compaction-recovery` 0.2.0 恢复 Claude Code 的原版压缩调度：插件对每次压缩只调用一次 `next(e)`，原样返回结果或错误。原版负责摘要、重试、预计算、取消和历史保存。名称保留，以便已有安装直接升级。
 
-`auto-compaction-recovery` 使用官方 [mods API](https://code.claude.com/docs/en/plugins/mods/overview)，需要 Claude Code 2.1.287+：
+0.1.x 在原版内部重试之外再追加最多三次，并在主窗口空闲时补做压缩。这会放大网络故障的等待时间。**0.2.0 删除了追加重试、空闲定时器和主动压缩调用**，也不额外查询额度或提交“继续”。它不再承诺恢复原版熔断后的压缩；持续的网络错误仍需要处理网络或上游问题。
 
-- 主窗口、子代理的自动压缩失败时，在同一个压缩位置额外重试最多三次，分别等待 0.5、1、2 秒。成功后直接继续原任务，不发送“继续”提示。
-- 重试成功会显示“压缩已恢复”和前后 token 数；`1/3`、`2/3`、`3/3` 表示追加重试的序号，不是成功通知。等待时间还包含原版摘要请求及其内部重试，不能把上述退避时间当成总耗时。
-- 主窗口正常结束一轮后，如果官方读取的输入 token 数仍超过显式配置的压缩窗口，使用官方 `$.session.compact()` 补做一次；空闲检查每 30 秒运行，同一窗口最多每五分钟发起一次补救。
-- 使用原版解析的窗口，支持环境变量、命令行和模型配置；不会写死 272K，也不改变用户关闭自动压缩的设置。
-- 已确认额度耗尽不追加重试；Esc、API 错误或拒绝结束的回合不触发空闲补救。后台子代理结束不会被当成主窗口空闲。已有 hook 否决保持有效。
-- 摘要生成、消息选择和历史持久化仍由原版执行。插件不修改凭据、会话文件或原版二进制，不清空输入框，不终止任务。
+## 状态含义
 
-这是失败恢复机制，**不是硬 token 上限**。持续的 API 故障仍可能耗尽重试；子代理只有原位重试，官方空闲压缩接口针对主窗口，不能强行压缩正在执行的子代理。重试可能产生额外的摘要请求和用量。未能压缩时保留原上下文并显示失败信息，不伪装成成功。
+插件只记录诊断元数据，按会话 ID、主窗口/子代理、触发类型分别存储，避免多个窗口覆盖同一条 `last-compaction`。记录包括开始时间、耗时、阶段和原版提供的 token 数；不保存提示词、摘要、原始错误或凭据。
 
-## 安装与现有窗口
+- `running`：这次原版压缩仍在执行。
+- `prepared`：后台预摘要已准备好，尚未表示它已替换当前上下文。
+- `complete`：原版前台压缩返回成功。
+- `failed` / `cancelled` / `skipped`：失败、用户取消或原版/hook 跳过。
 
-`python3 scripts/install.py` 会同时安装插件。新启动的 `claude-auto` 自动加载本地副本；旧版客户端保留原有行为并提示版本要求。未通过官方插件管理器安装时，可以用 `CLAUDE_AUTO_COMPACTION_RECOVERY=0 claude-auto` 关闭自动加载。
+后台预摘要失败时，提示明确标注“后台预摘要”，不会再暗示前台压缩已经停止。错误只分为连接中断、超时、额度限制和其他请求失败；这些分类不能单独判定问题出在代理还是服务端。关闭插件后，原版仍负责所有压缩。
 
-已有 Claude Code 窗口可通过官方插件管理器加载，无需中断工作或重新登录。在与活动窗口一致的 `CLAUDE_CONFIG_DIR` 下运行：
+## 400K 与状态栏
+
+窗口设置继续由原版解析：环境变量、命令行、模型配置和设置的优先级不变。它是自动压缩窗口，不是强制 token 上限。
+
+例如原版 2.1.296 配置 400000 tokens 时，还会预留输出和压缩空间，常见实际触发点约为 367000 tokens。状态栏的 `context 36%` 按模型的 1M 窗口计算；`0% until auto-compact` 表示已接近/到达自动压缩触发点，**不是压缩完成百分比**。
+
+`API_TIMEOUT_MS` 限制请求，不是整次压缩的总时限；原版内部仍可能重试或使用备用摘要方式。插件不另加一个可能留下后台请求的强制取消计时器，也不改变网络超时。
+
+## 安装和已有窗口
+
+需要支持官方 [mods API](https://code.claude.com/docs/en/plugins/mods/overview) 的 Claude Code 2.1.287+。安装器复制本地插件，新启动的 `claude-auto` 加载该副本；已通过插件管理器安装时不会重复加载 inline 副本。
+
+升级源码安装：
+
+```bash
+python3 scripts/install.py
+```
+
+已经通过本地 marketplace 安装的插件还需要更新缓存。在与目标窗口一致的 `CLAUDE_CONFIG_DIR` 下运行：
 
 ```bash
 claude plugin marketplace add "$HOME/.local/share/claude-auto"
-claude plugin install auto-compaction-recovery@auto-account-tools --scope user
+claude plugin update auto-compaction-recovery@auto-account-tools
 ```
 
-然后在已有窗口中运行 **`/reload-plugins`**。官方[插件加载说明](https://code.claude.com/docs/en/plugins/mods/overview#install-or-update-a-mod)要求这一步；仅替换磁盘文件不等于已运行的窗口加载了修复。在 `/plugin` 查看 active mods 可确认。通过插件管理器安装后，启动器不再加载重复的 inline 副本；需要关闭时使用 `/plugin disable auto-compaction-recovery@auto-account-tools`。
+然后在目标窗口执行 **`/reload-plugins`**。官方[加载说明](https://code.claude.com/docs/en/plugins/mods/overview#install-or-update-a-mod)要求在已有窗口重新加载；只替换文件或修改 `enabledPlugins` 不能证明正在运行的 hooks 已更新。如果该窗口仍在等待压缩，可由用户按 Esc 取消本次等待后重新加载，保留原会话；不要使用 `/clear` 丢弃上下文。
+
+在 `/plugin` 确认版本为 **0.2.0**。也可以在该窗口通过 `/plugin disable auto-compaction-recovery@auto-account-tools` 关闭插件。未通过插件管理器安装时，`CLAUDE_AUTO_COMPACTION_RECOVERY=0 claude-auto` 可关闭启动器的自动加载。
 
 ## 验证
 
@@ -34,4 +52,6 @@ python3 -m unittest discover -s tests -v
 claude plugin validate plugins/compaction-recovery
 ```
 
-回归测试覆盖失败预算、主窗口和子代理、取消、hook 否决、已耗尽额度、空闲时机、窗口来源和安装兼容性。2026-10-10 还使用原版 2.1.296、独立配置目录、回环模拟 API 进行了客户端实测：未修复时三次摘要失败会打开熔断；修复后第四次摘要成功，主窗口和子代理继续；交互 PTY 中的超窗主窗口在回合结束后完成补压缩。API 用量及失败是注入的测试数据，没有消耗订阅额度；这不代表真实网络永远不会压缩失败。
+回归覆盖原样传递、失败不追加请求、取消、hook 否决、后台预摘要与前台并行、会话隔离，以及诊断失败不改变原版结果。
+
+2026-10-12 使用原版 2.1.296、独立配置和回环模拟 API 做了对照：400K 窗口下，正常摘要三种版本均为一次请求；持续摘要失败时，原版为三次，0.1.1 为十二次，0.2.0 回到三次。子代理和注入连接重置场景也与原版请求数量一致。故障数据和 token 用量由模拟 API 注入，不消耗真实订阅额度；这验证了插件不会放大重试，不代表真实网络不会失败。

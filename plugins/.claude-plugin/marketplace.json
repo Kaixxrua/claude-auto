@@ -5,6 +5,6 @@
   "plugins": [{
     "name": "auto-compaction-recovery",
     "source": "./compaction-recovery",
-    "description": "Recover from transient native compaction failures."
+    "description": "Observe native compaction without changing its scheduling or retries."
   }]
 }

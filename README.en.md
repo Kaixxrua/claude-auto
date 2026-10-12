@@ -6,7 +6,7 @@ A local account launcher and quota dashboard for Claude Code. After a confirmed 
 
 Independent community project. The official Claude Code client is neither bundled nor modified. Use only accounts you are authorized to access; provider limits, permissions, and terms still apply.
 
-Claude Code 2.1.287+ also supports bounded recovery from failed compaction in main sessions and subagents, plus idle recovery of an exceeded main-session window. See [activation and limitations](docs/compaction.md).
+On Claude Code 2.1.287+, the compaction plugin records native outcomes without adding retries or idle compaction requests. Background precomputation is reported separately from foreground compaction. See [upgrading and limitations](docs/compaction.md).
 
 ![Quota dashboard with fictional accounts and sample usage](docs/dashboard.png)
 
