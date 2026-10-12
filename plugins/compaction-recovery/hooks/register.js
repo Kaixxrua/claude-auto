@@ -1,125 +1,69 @@
 // SPDX-License-Identifier: Apache-2.0
-// Uses Claude Code's public mods API. The engine owns every summary and message.
-const RETRY_DELAYS = [500, 1000, 2000];
-const IDLE_COOLDOWN = 300000;
+// Observe the native scheduler. Never start, repeat, or replace a compaction.
 
-async function record($, values) {
-  // Metadata only: never persist prompts, summaries, errors or credentials.
-  try {
-    await $.store.set('last-compaction', { at: await $.clock.now(), ...values });
-  } catch { /* Observability must not turn a successful compaction into failure. */ }
+async function observe(operation) {
+  try { return await operation(); } catch { return undefined; }
 }
 
-async function note($, text) {
-  try { await $.ui.log(text); } catch { /* A headless run has no UI. */ }
+function failureKind(error) {
+  const message = String(error?.message ?? error);
+  if (/ECONNRESET|ECONNREFUSED|EPIPE|connection (?:dropped|lost|reset)/i.test(message)) return 'connection';
+  if (/timeout|timed out|no response from API/i.test(message)) return 'timeout';
+  if (/rate.?limit|hit your .+ limit|HTTP 429/i.test(message)) return 'quota';
+  return 'other';
 }
 
-async function quotaBlocked($) {
-  try {
-    const usage = await $.session.usage();
-    return usage.rateLimits.some(limit => limit.percentUsed >= 100);
-  } catch { return false; }
+function failureNotice(trigger, agentId, kind) {
+  const reason = { connection: '连接中断', timeout: '请求超时', quota: '额度限制', other: '请求失败' }[kind];
+  // A precomputed summary has not replaced the transcript. Its failure says
+  // nothing about a concurrent foreground compaction or its spinner.
+  if (trigger === 'precompute') return `后台预摘要未完成（${reason}）；前台压缩状态以 Claude Code 为准。`;
+  return `${agentId ? '子代理' : '上下文'}压缩未完成（${reason}）；交由 Claude Code 原版处理，插件不追加请求。`;
 }
 
 export function register(on) {
-  const state = { running: false, checking: false, suspended: false,
-    lastAttempt: -Infinity, timer: undefined };
-
+  const active = new Map();
   on('session.compact', async ($, e, next) => {
-    // A user cancellation, a hook veto, and a manual request must retain their
-    // original meaning. Precomputation is also left to the native scheduler.
-    const delays = e.trigger === 'auto' ? RETRY_DELAYS : [];
-    for (let attempt = 0; ; attempt += 1) {
-      try {
-        const result = await next(e);
-        await record($, {
-          agentId: e.agentId ?? null, trigger: e.trigger, attempts: attempt + 1,
-          phase: result.skip ? 'skipped' : 'complete',
-          tokensBefore: result.tokensBefore ?? null,
-          tokensAfter: result.tokensAfter ?? null,
+    const [sessionId, startedAt] = await Promise.all([
+      observe(() => $.session.id()), observe(() => $.clock.now()),
+    ]);
+    const key = sessionId ? `compaction:${sessionId}:${e.agentId ?? 'main'}:${e.trigger}` : null;
+    const operation = {};
+    if (key) active.set(key, operation);
+    const current = () => !key || active.get(key) === operation;
+    async function record(values) {
+      if (!key || !current()) return;
+      await observe(async () => {
+        const at = await $.clock.now();
+        if (!current()) return;
+        await $.store.set(key, {
+          version: 2, sessionId, agentId: e.agentId ?? null, trigger: e.trigger,
+          startedAt: startedAt ?? null, at,
+          elapsedMs: Number.isFinite(startedAt) ? Math.max(0, at - startedAt) : null,
+          ...values,
         });
-        if (attempt > 0 && !result.skip) {
-          const size = Number.isFinite(result.tokensBefore) && Number.isFinite(result.tokensAfter)
-            ? `：${result.tokensBefore} → ${result.tokensAfter} tokens` : '';
-          await note($, `${e.agentId ? '子代理' : '上下文'}压缩已恢复${size}。`);
-        }
-        return result;
-      } catch (error) {
-        if (next.signal.aborted) throw error;
-        if (attempt >= delays.length || await quotaBlocked($)) {
-          await record($, { agentId: e.agentId ?? null, trigger: e.trigger,
-            phase: 'failed', attempts: attempt + 1 });
-          await note($, delays.length ? '压缩失败，已保留原上下文；有限重试已停止。'
-            : '压缩失败，已保留原上下文。');
-          throw error;
-        }
-        await record($, { agentId: e.agentId ?? null, trigger: e.trigger,
-          phase: 'retrying', attempts: attempt + 1 });
-        await note($, `压缩失败，正在自动重试 ${attempt + 1}/${delays.length}。`);
-        await $.clock.sleep(delays[attempt], { signal: next.signal });
-        if (next.signal.aborted) throw error;
-      }
+      });
+    }
+    await record({ phase: 'running' });
+    try {
+      // Exactly one native dispatch, with the original input and result.
+      // Native retries, precomputation, cancellation and history stay native.
+      const result = await next(e);
+      await record({
+        phase: result.skip ? 'skipped' : e.trigger === 'precompute' ? 'prepared' : 'complete',
+        tokensBefore: result.tokensBefore ?? null, tokensAfter: result.tokensAfter ?? null,
+      });
+      return result;
+    } catch (error) {
+      const cancelled = next.signal.aborted;
+      const kind = failureKind(error);
+      await record({ phase: cancelled ? 'cancelled' : 'failed', failure: kind });
+      if (!cancelled && current()) await observe(() => $.ui.log(failureNotice(e.trigger, e.agentId, kind)));
+      // Propagate the same failure. Returning a fabricated summary or a veto
+      // here would change the native scheduler's outcome.
+      throw error;
+    } finally {
+      if (key && current()) active.delete(key);
     }
   });
-
-  on('turn.start', ($, e, next) => {
-    state.running = true;
-    state.suspended = false;
-    return next(e);
-  });
-  on('turn.complete', async ($, e, next) => {
-    const result = await next(e);
-    if (!e.agentId) {
-      state.running = false;
-      state.suspended = e.isAborted || e.reason !== 'answer';
-      if (!state.suspended) await recoverIdle($, state);
-    }
-    return result;
-  });
-  on('session.start', async ($, e, next) => {
-    const result = await next(e);
-    state.timer?.cancel();
-    state.timer = $.clock.every(30000, () => recoverIdle($, state));
-    return result;
-  });
-  on('session.end', ($, e, next) => {
-    state.timer?.cancel();
-    state.timer = undefined;
-    state.suspended = true;
-    return next(e);
-  });
-}
-
-async function recoverIdle($, state) {
-  if (state.running || state.checking || state.suspended) return;
-  state.checking = true;
-  try {
-    const now = await $.clock.now();
-    if (now - state.lastAttempt < IDLE_COOLDOWN) return;
-    // "summary" estimates locally; it makes no token-count API request.
-    // The engine resolves env / --autocompact / per-model / settings for us.
-    const { context, rateLimits } = await $.session.usage({ breakdown: 'summary' });
-    const window = context.breakdown;
-    if (state.running || state.suspended || !window?.isAutoCompactEnabled || window.autocompactSource === 'auto' ||
-        !Number.isFinite(window.rawMaxTokens) || window.rawMaxTokens < 100000 ||
-        !Number.isFinite(context.tokens) || context.tokens < window.rawMaxTokens ||
-        rateLimits.some(limit => limit.percentUsed >= 100)) return;
-    state.lastAttempt = now;
-    await record($, { phase: 'idle-recovery', tokensBefore: context.tokens,
-      window: window.rawMaxTokens });
-    await note($, `上下文已超过 ${window.rawMaxTokens} tokens，正在空闲时补做压缩。`);
-    // This public API refuses to run if another turn won the race. It neither
-    // interrupts a turn nor clears the prompt box. No synthetic "continue".
-    const result = await $.session.compact();
-    if (result.skip) state.suspended = true;
-    await record($, { phase: result.skip ? 'skipped' : 'complete',
-      trigger: 'idle-recovery', tokensBefore: result.tokensBefore ?? context.tokens,
-      tokensAfter: result.tokensAfter ?? null });
-  } catch (error) {
-    if (/abort|cancel|interrupt/i.test(String(error))) state.suspended = true;
-    await record($, { phase: 'idle-deferred' });
-    // Busy, interrupted or offline: retry only at a later safe boundary.
-  } finally {
-    state.checking = false;
-  }
 }
