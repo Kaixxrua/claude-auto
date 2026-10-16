@@ -381,14 +381,17 @@ class Jobs:
         env = self.child_env(registry, name)
         out = directory/f"events-{d['attempt']}.jsonl"
         err = directory/f"stderr-{d['attempt']}.txt"
-        with out.open('wb') as stdout, err.open('wb') as stderr:
+        # A pipe write can block before the cancellation loop when the caller
+        # passes a large prompt and native startup has not read stdin yet.
+        prompt = directory/f"prompt-{d['attempt']}.txt"
+        prompt.write_text(d['prompt'], encoding='utf-8')
+        prompt.chmod(0o600)
+        with prompt.open('rb') as stdin, out.open('wb') as stdout, err.open('wb') as stderr:
             out.chmod(0o600); err.chmod(0o600)
-            process = subprocess.Popen(args, env=env, cwd=d['cwd'], stdin=subprocess.PIPE,
+            process = subprocess.Popen(args, env=env, cwd=d['cwd'], stdin=stdin,
                                        stdout=stdout, stderr=stderr, start_new_session=True, pass_fds=lease_fds)
             self.save(d, status='running', native_pid=process.pid, native_start=process_start(process.pid), history_root=history_root)
             try:
-                process.stdin.write(d['prompt'].encode())
-                process.stdin.close()
                 heartbeat = time.monotonic()
                 while process.poll() is None:
                     if stop.wait(.2):

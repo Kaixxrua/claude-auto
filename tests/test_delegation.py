@@ -35,6 +35,7 @@ assert '-p' in sys.argv and '--strict-mcp-config' in sys.argv
 assert sys.argv[sys.argv.index('--permission-mode')+1] == 'dontAsk'
 assert '--dangerously-skip-permissions' not in sys.argv
 assert 'CLAUDECODE' not in os.environ
+if options.get('stall_stdin'): time.sleep(30)
 prompt = sys.stdin.read()
 resuming = '--resume' in sys.argv
 sid = sys.argv[sys.argv.index('--resume' if resuming else '--session-id')+1]
@@ -196,6 +197,12 @@ class DelegationTests(unittest.TestCase):
         self.assertEqual(self.until(one['job_id'])['status'],'cancelled')
         self.assertEqual(self.jobs.read(two['job_id'])['status'],'running')
         self.assertEqual(self.until(two['job_id'])['status'],'completed')
+
+    def test_large_prompt_cancellation_does_not_wait_for_stdin_reader(self):
+        (self.root/'alpha/fixture.json').write_text(json.dumps({'email':'alpha@example.test','stall_stdin':True}))
+        job=self.submit('x'*100_000);self.until(job['job_id'],{'running'})
+        self.jobs.cancel(job['job_id'])
+        self.assertEqual(self.until(job['job_id'],seconds=5)['status'],'cancelled')
 
     def test_resume_preserves_session_across_accounts(self):
         first=self.submit();old=self.until(first['job_id'])
