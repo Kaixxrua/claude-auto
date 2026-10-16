@@ -9,6 +9,7 @@
 | `~/.local/bin/claude-accounts` | 账号管理与切换控制器 |
 | `~/.local/bin/claude-auto` | 控制器的交互入口 |
 | `~/.local/bin/claude-quota` | 额度台入口 |
+| `~/.local/bin/claude-delegate` | 可选跨账号委派的 stdio MCP 服务 |
 | `~/.local/share/claude-quota-monitor/` | 额度台 Python 和静态资源 |
 | `~/.local/share/doc/claude-auto/` | LICENSE 与 NOTICE |
 | `~/.claude-accounts/accounts.json` | 本机账号目录注册表 |
@@ -98,4 +99,4 @@ OAuth 刷新由官方客户端负责。启动器等待官方刷新锁，不删�
 
 ## 卸载
 
-如启用了服务，先停止并禁用它，退出工作会话后删除安装的三个命令、额度台程序目录与用户服务文件。账号目录和 `state/` 不由卸载自动删除，便于恢复工作；确认不再需要后自行处理。这些目录不能放进公共仓库或公开日志。
+如启用了服务，先停止并禁用它，退出工作会话并停止委派任务后删除安装的四个命令、额度台程序目录与用户服务文件。可选插件先通过官方插件管理器卸载。账号目录和 `state/` 不由卸载自动删除，便于恢复工作；确认不再需要后自行处理。这些目录不能放进公共仓库或公开日志。

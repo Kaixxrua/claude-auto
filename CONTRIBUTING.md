@@ -4,7 +4,7 @@ Use Linux with Python 3.10+ and the system timezone database. The launcher and d
 
 ```bash
 python3 -m unittest discover -s tests -v
-python3 -m py_compile bin/claude-accounts dashboard/monitor.py dashboard/reset_cards.py scripts/install.py
+python3 -m py_compile bin/claude-accounts bin/claude-delegate dashboard/monitor.py dashboard/reset_cards.py scripts/install.py plugins/account-delegation/scripts/server.py
 sh -n bin/claude-auto bin/claude-quota
 node --check dashboard/static/app.js
 node --test tests/test_compaction.mjs
@@ -12,6 +12,8 @@ python3 scripts/check_release.py
 ```
 
 The suite exercises real PTYs with a fake upstream CLI, concurrent controllers, checkpoint integrity, account selection, login lock handling, reset-card confirmation/idempotency, Host/Origin checks, and a fresh installation with a loopback HTTP server. Tests isolate account files in temporary directories. A passing mock suite does not establish compatibility with a new upstream CLI release; report the version when performing an opt-in manual check.
+
+Delegation tests also cover MCP messages, concurrent identity leases, disabled/unknown/exhausted accounts, cancellation, worker crashes and native session resumption across accounts. They never require live subscriptions.
 
 Keep changes small and include regression coverage when changing switching, persistence, credential handling, or HTTP actions. Use commit titles such as `fix(launcher): preserve session lease during recovery`.
 

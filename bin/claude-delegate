@@ -1,0 +1,523 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+"""Optional stdio MCP tools for independent, quota-aware Claude Code jobs."""
+from __future__ import annotations
+
+import argparse
+import contextlib
+import fcntl
+import hashlib
+import importlib.machinery
+import importlib.util
+import json
+import math
+import os
+from pathlib import Path
+import re
+import signal
+import subprocess
+import sys
+import threading
+import time
+import uuid
+
+SCRIPT = Path(__file__).resolve()
+TERMINAL = {'completed', 'failed', 'blocked', 'cancelled', 'timed_out', 'quota_exhausted', 'interrupted'}
+JOB_ID = re.compile(r'[a-f0-9]{32}\Z')
+WINDOWS = ('five_hour', 'seven_day')
+CACHE_SECONDS = 120
+
+
+def load_module(name, path):
+    loader = importlib.machinery.SourceFileLoader(name, str(path))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+def dependencies():
+    adapter = load_module('delegation_accounts', SCRIPT.with_name('claude-accounts'))
+    dashboard = SCRIPT.parent.parent/'share/claude-quota-monitor'
+    if not dashboard.is_dir():
+        dashboard = SCRIPT.parent.parent/'dashboard'
+    sys.path.insert(0, str(dashboard))
+    monitor = load_module('delegation_monitor', dashboard/'monitor.py')
+    return adapter, monitor
+
+
+def identity(status):
+    email = status.get('email')
+    if not isinstance(email, str) or not email.strip():
+        return None
+    return hashlib.sha256(email.strip().casefold().encode()).hexdigest()
+
+
+def process_start(pid):
+    """PID plus Linux start ticks prevents signaling or adopting a reused PID."""
+    try:
+        fields = Path(f'/proc/{int(pid)}/stat').read_text().rsplit(')', 1)[1].split()
+        return None if fields[0] == 'Z' else fields[19]
+    except (OSError, ValueError, IndexError, TypeError):
+        return None
+
+
+def number(value):
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+
+
+def valid_windows(windows, now, fresh=True):
+    for key in WINDOWS:
+        w = windows.get(key, {})
+        used, at, reset = (w.get(k) for k in ('used_percentage', 'observed_at', 'resets_at'))
+        if (not number(used) or not 0 <= used <= 100 or not number(at) or
+                at > now + 1 or (fresh and now - at > CACHE_SECONDS) or
+                w.get('source') not in ('official_cli_usage', 'official_oauth_api') or
+                (reset is None and used != 0) or
+                (reset is not None and (not number(reset) or reset <= now))):
+            return False
+    return True
+
+
+@contextlib.contextmanager
+def lease(path):
+    """A kernel lease is released even when the owning worker crashes."""
+    fd = os.open(path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            yield False
+        else:
+            yield fd
+    finally:
+        os.close(fd)
+
+
+class Jobs:
+    def __init__(self, adapter, monitor):
+        self.a, self.monitor = adapter, monitor
+        self.root = adapter.ROOT/'state/delegation'
+        for part in ('', 'jobs', 'leases', 'quota'):
+            adapter.private_dir(self.root/part)
+
+    def directory(self, job_id):
+        if not isinstance(job_id, str) or not JOB_ID.fullmatch(job_id):
+            raise ValueError('Invalid job_id')
+        return self.root/'jobs'/job_id
+
+    def read(self, job_id):
+        d = self.a.read_json(self.directory(job_id)/'job.json', None)
+        if d is None:
+            raise ValueError('Unknown job_id')
+        if d['status'] not in TERMINAL and d.get('worker_pid'):
+            if process_start(d['worker_pid']) != d.get('worker_start'):
+                # Read-only inference; do not race a resume by writing old state.
+                d = dict(d, status='interrupted', reason='Worker exited; inspect and resume explicitly.')
+        return d
+
+    def save(self, d, **updates):
+        d.update(updates, updated_at=time.time())
+        self.a.write_json(self.directory(d['job_id'])/'job.json', d)
+
+    def public(self, d):
+        keys = ('job_id', 'session_id', 'title', 'cwd', 'mode', 'model', 'status', 'account',
+                'attempt', 'created_at', 'updated_at', 'reason', 'returncode', 'quota', 'permission_denials')
+        return {k: d[k] for k in keys if k in d}
+
+    def parent_account(self, registry):
+        current = Path(os.environ.get('CLAUDE_CONFIG_DIR', str(Path.home()/'.claude'))).resolve()
+        return next((n for n, p in registry['profiles'].items() if Path(p).resolve() == current), None)
+
+    def launch(self, d):
+        directory = self.directory(d['job_id'])
+        env = os.environ.copy()
+        env['CLAUDE_ACCOUNTS_HOME'] = str(self.a.ROOT)
+        with (directory/f"worker-{d['attempt']}.log").open('ab') as log:
+            os.chmod(log.name, 0o600)
+            process = subprocess.Popen([sys.executable, str(SCRIPT), '_worker', d['job_id']],
+                                       stdin=subprocess.DEVNULL, stdout=log, stderr=log,
+                                       env=env, start_new_session=True, close_fds=True)
+        self.save(d, worker_pid=process.pid, worker_start=process_start(process.pid))
+        threading.Thread(target=process.wait, daemon=True).start()
+        # Worker takes the job lock after the caller has written its PID.
+        return self.public(d)
+
+    def submit(self, prompt, cwd, title='Delegated task', mode='read-only', model=None, max_seconds=3600):
+        if not isinstance(prompt, str) or not prompt.strip() or len(prompt) > 100_000:
+            raise ValueError('prompt must contain 1–100000 characters')
+        if not isinstance(title, str) or not 1 <= len(title) <= 120:
+            raise ValueError('title must contain 1–120 characters')
+        if not isinstance(cwd, str) or not Path(cwd).is_absolute() or not Path(cwd).is_dir():
+            raise ValueError('cwd must be an existing absolute directory')
+        if mode not in ('read-only', 'project'):
+            raise ValueError('mode must be read-only or project')
+        if model is not None and (not isinstance(model, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._\[\]-]{0,127}', model)):
+            raise ValueError('Invalid model')
+        if not isinstance(max_seconds, int) or isinstance(max_seconds, bool) or not 30 <= max_seconds <= 28800:
+            raise ValueError('max_seconds must be 30–28800')
+        registry = self.a.load_registry()
+        job_id = uuid.uuid4().hex
+        self.a.private_dir(self.directory(job_id))
+        with self.a.state_lock(self.directory(job_id)/'lock'):
+            d = {'job_id': job_id, 'session_id': str(uuid.uuid4()), 'title': title,
+                 'prompt': prompt, 'cwd': str(Path(cwd).resolve()), 'mode': mode, 'model': model,
+                 'max_seconds': max_seconds, 'parent_account': self.parent_account(registry),
+                 'status': 'queued', 'account': None, 'attempt': 1, 'created_at': time.time(),
+                 'resume': False, 'history_root': None}
+            self.save(d)
+            return self.launch(d)
+
+    def resume(self, job_id, prompt):
+        if not isinstance(prompt, str) or not prompt.strip() or len(prompt) > 100_000:
+            raise ValueError('Supply an explicit continuation prompt (1–100000 characters)')
+        directory = self.directory(job_id)
+        with self.a.state_lock(directory/'lock'):
+            d = self.read(job_id)
+            if d['status'] not in TERMINAL:
+                raise ValueError('Job is still running')
+            # A crashed worker may have left its own native child alive.
+            if d.get('native_pid') and process_start(d['native_pid']) == d.get('native_start'):
+                raise ValueError('Original Claude process is still running; do not start a duplicate')
+            if d.get('history_root'):
+                files = list(Path(d['history_root']).glob(f"*/{d['session_id']}.jsonl"))
+                if len(files) != 1 or not files[0].stat().st_size:
+                    raise ValueError('Saved session is missing or ambiguous; inspect before resuming')
+                # Never resume through a partial last record left by an interrupted write.
+                try:
+                    last = files[0].read_bytes().rstrip().rsplit(b'\n', 1)[-1]
+                    json.loads(last)
+                except (OSError, ValueError):
+                    raise ValueError('Saved session has an incomplete final record') from None
+            (directory/'cancel').unlink(missing_ok=True)
+            d.update(prompt=prompt, attempt=d['attempt']+1, resume=bool(d.get('history_root')),
+                     status='queued', account=None, native_pid=None, native_start=None,
+                     worker_pid=None, worker_start=None, reason=None, returncode=None,
+                     permission_denials=0)
+            self.save(d)
+            return self.launch(d)
+
+    def cancel(self, job_id):
+        with self.a.state_lock(self.directory(job_id)/'lock'):
+            d = self.read(job_id)
+            pid = d.get('native_pid')
+            if (d['status'] == 'interrupted' and pid and
+                    process_start(pid) == d.get('native_start') and os.getpgid(pid) == pid):
+                # A worker crash must not leave an uncancellable orphan. Both
+                # PID birth and the dedicated process group must still match.
+                self.a.write_json(self.directory(job_id)/'cancel', {'at': time.time()})
+                with contextlib.suppress(ProcessLookupError):
+                    os.killpg(pid, signal.SIGTERM)
+                deadline = time.monotonic()+10
+                while process_start(pid) == d.get('native_start') and time.monotonic() < deadline:
+                    time.sleep(.1)
+                if process_start(pid) == d.get('native_start'):
+                    with contextlib.suppress(ProcessLookupError):
+                        os.killpg(pid, signal.SIGKILL)
+                self.save(d, status='cancelled', reason='Cancelled this job after its worker exited.')
+                return self.public(d)
+            if d['status'] not in TERMINAL:
+                self.a.write_json(self.directory(job_id)/'cancel', {'at': time.time()})
+                return {**self.public(d), 'cancel_requested': True}
+            return self.public(d)
+
+    def result(self, job_id, wait_seconds=0, offset=0):
+        if not number(wait_seconds) or not 0 <= wait_seconds <= 25:
+            raise ValueError('wait_seconds must be 0–25')
+        if not isinstance(offset, int) or isinstance(offset, bool) or offset < 0:
+            raise ValueError('offset must be a nonnegative character offset')
+        deadline = time.monotonic()+wait_seconds
+        while True:
+            d = self.read(job_id)
+            if d['status'] in TERMINAL or time.monotonic() >= deadline:
+                break
+            time.sleep(.2)
+        value = self.public(d)
+        p = self.directory(job_id)/f"result-{d['attempt']}.json"
+        result = self.a.read_json(p, {})
+        text = result.get('text', '')
+        value.update(text=text[offset:offset+24000], next_offset=(offset+24000 if len(text) > offset+24000 else None))
+        return value
+
+    def listing(self):
+        values = [self.read(p.parent.name) for p in (self.root/'jobs').glob('*/job.json')]
+        return {'jobs': [self.public(d) for d in sorted(values, key=lambda d: d['updated_at'], reverse=True)[:30]]}
+
+    def cached_windows(self, name, account_identity):
+        private = self.a.read_json(self.root/'quota'/f'{name}.json', {})
+        observed = self.a.read_json(self.a.ROOT/'state/monitor/accounts.json', {}).get(name, {})
+        records = []
+        if private.get('identity') == account_identity:
+            records.append(private)
+        if identity(observed) == account_identity and observed.get('loggedIn') and not observed.get('error'):
+            records.append(observed)
+        records.sort(key=lambda r: min((r.get('windows', {}).get(k, {}).get('observed_at', 0) for k in WINDOWS)), reverse=True)
+        for record in records:
+            if valid_windows(record.get('windows', {}), time.time()):
+                return record['windows'], record.get('usage_query_started_at', 0)
+        return {}, 0
+
+    def checked_windows(self, registry, name, status, stop, cwd):
+        account_identity = identity(status)
+        windows, started = self.cached_windows(name, account_identity)
+        if not windows:
+            started = time.time()
+            windows = self.monitor.probe_usage(registry['claude'], self.child_env(registry, name), cwd, stop_event=stop)
+            self.a.write_json(self.root/'quota'/f'{name}.json', {
+                'identity': account_identity, 'windows': windows, 'usage_query_started_at': started})
+        if not valid_windows(windows, time.time()):
+            raise ValueError('Quota data is incomplete, stale, or unconfirmed')
+        if any(windows[k]['used_percentage'] >= 100 for k in WINDOWS):
+            raise ValueError('Account quota exhausted')
+        self.a.record_quota_recovery(self.a.ROOT/'state', name, windows, time.time(), started)
+        q = self.a.read_quota_state(self.a.ROOT/'state').get(name, {})
+        if (q.get('blocked_until') == self.a.DISABLED_UNTIL or
+                (q.get('source') != 'official_usage_recovery' and q.get('recorded_at', 0) >= started)):
+            raise ValueError('Newer quota failure supersedes the usage query')
+        return windows
+
+    def child_env(self, registry, name):
+        env = self.a.profile_env(registry, name)
+        for key in ('CLAUDECODE', 'CLAUDE_CODE_SESSION_ID', 'CLAUDE_SESSION_ID',
+                    'CLAUDE_CODE_PARENT_SESSION_ID', 'CLAUDE_CODE_AGENT_ID', 'CLAUDE_CODE_ENTRYPOINT',
+                    'CLAUDE_ACCOUNTS_CONTROLLER_PID', 'CLAUDE_ACCOUNTS_CLIENT_ID'):
+            env.pop(key, None)
+        return env
+
+    def candidates(self, registry, d):
+        records = self.a.read_json(self.a.ROOT/'state/monitor/accounts.json', {})
+        def rank(name):
+            w = records.get(name, {}).get('windows', {})
+            # Old data is only a sorting hint, never authorization to run.
+            values = [w.get(k, {}).get('used_percentage', 100) for k in WINDOWS]
+            return max(v if number(v) else 100 for v in values)
+        return sorted((n for n in registry['profiles']
+                       if n != d.get('parent_account') and not self.a.disabled_reason(registry, n)), key=rank)
+
+    def worker(self, job_id):
+        directory = self.directory(job_id)
+        with self.a.state_lock(directory/'lock'):
+            d = self.read(job_id)
+            if d.get('worker_pid') != os.getpid():
+                return
+            self.save(d, status='selecting')
+        stop = threading.Event()
+        end = threading.Event()
+        deadline = time.monotonic()+d['max_seconds']
+        def watch():
+            while not end.wait(.2):
+                if (directory/'cancel').exists() or time.monotonic() >= deadline:
+                    stop.set()
+        watcher = threading.Thread(target=watch, daemon=True)
+        watcher.start()
+        try:
+            registry = self.a.load_registry()
+            parent = d.get('parent_account')
+            parent_identity = None
+            if parent in registry['profiles'] and not self.a.disabled_reason(registry, parent):
+                parent_identity = identity(self.a.auth_status(registry, parent))
+            failures = []
+            for name in self.candidates(registry, d):
+                if stop.is_set():
+                    break
+                with lease(self.root/'leases'/f'profile-{name}.lock') as available:
+                    if not available:
+                        failures.append(f'{name}: busy')
+                        continue
+                    try:
+                        status = self.a.auth_status(registry, name)
+                        who = identity(status)
+                        if not self.a.eligible(status) or not who or who == parent_identity:
+                            failures.append(f'{name}: unavailable identity')
+                            continue
+                        with lease(self.root/'leases'/f'identity-{who}.lock') as unique:
+                            if not unique:
+                                failures.append(f'{name}: identity busy')
+                                continue
+                            windows = self.checked_windows(registry, name, status, stop, d['cwd'])
+                            registry = self.a.load_registry()
+                            if self.a.disabled_reason(registry, name):
+                                raise ValueError('Account disabled during selection')
+                            if stop.is_set():
+                                break
+                            # Authentication can change while a usage request is in flight.
+                            if identity(self.a.auth_status(registry, name)) != who:
+                                raise ValueError('Account identity changed during selection')
+                            target = str((Path(registry['profiles'][name])/'projects').resolve())
+                            if d.get('history_root') and target != d['history_root']:
+                                raise ValueError('Target account does not share this saved history')
+                            self.save(d, account=name, quota={k: windows[k]['used_percentage'] for k in WINDOWS})
+                            try:
+                                self.run_native(registry, name, d, stop, deadline, target, (available, unique))
+                            except Exception as exc:
+                                # Once execution begins, never replay a possibly mutating
+                                # task on another account due to a transport/local error.
+                                self.save(d, status='failed', reason=type(exc).__name__)
+                            return
+                    except (ValueError, RuntimeError, OSError) as exc:
+                        # Never return subprocess output, credentials, or login identity.
+                        failures.append(f'{name}: {type(exc).__name__}')
+            if stop.is_set():
+                self.save(d, status='cancelled' if (directory/'cancel').exists() else 'timed_out')
+            else:
+                self.save(d, status='blocked', reason='No confirmed available account. '+ '; '.join(failures))
+        except Exception as exc:
+            self.save(d, status='failed', reason=type(exc).__name__)
+        finally:
+            end.set()
+            watcher.join(timeout=1)
+
+    def run_native(self, registry, name, d, stop, deadline, history_root, lease_fds=()):
+        directory = self.directory(d['job_id'])
+        args = [registry['claude'], '-p', '--output-format', 'stream-json', '--verbose',
+                '--permission-mode', 'dontAsk', '--permission-prompts', 'none',
+                '--strict-mcp-config', '--mcp-config', '{"mcpServers":{}}',
+                '--disallowedTools', 'Agent,Task,SendMessage']
+        if d['mode'] == 'read-only':
+            args += ['--safe-mode', '--tools', 'Read,Glob,Grep', '--allowedTools', 'Read,Glob,Grep']
+        if d.get('model'):
+            args += ['--model', d['model']]
+        args += ['--resume' if d['resume'] else '--session-id', d['session_id']]
+        env = self.child_env(registry, name)
+        out = directory/f"events-{d['attempt']}.jsonl"
+        err = directory/f"stderr-{d['attempt']}.txt"
+        with out.open('wb') as stdout, err.open('wb') as stderr:
+            out.chmod(0o600); err.chmod(0o600)
+            process = subprocess.Popen(args, env=env, cwd=d['cwd'], stdin=subprocess.PIPE,
+                                       stdout=stdout, stderr=stderr, start_new_session=True, pass_fds=lease_fds)
+            self.save(d, status='running', native_pid=process.pid, native_start=process_start(process.pid), history_root=history_root)
+            try:
+                process.stdin.write(d['prompt'].encode())
+                process.stdin.close()
+                heartbeat = time.monotonic()
+                while process.poll() is None:
+                    if stop.wait(.2):
+                        with contextlib.suppress(ProcessLookupError):
+                            os.killpg(process.pid, signal.SIGTERM)
+                        try:
+                            process.wait(timeout=10)
+                        except subprocess.TimeoutExpired:
+                            # Only this job's own process group; never another window.
+                            os.killpg(process.pid, signal.SIGKILL)
+                            process.wait(timeout=5)
+                        break
+                    if time.monotonic()-heartbeat > 5:
+                        self.save(d)
+                        heartbeat = time.monotonic()
+            finally:
+                if process.poll() is None:
+                    process.terminate()
+                    process.wait(timeout=10)
+        final = None; quota_error = False
+        for line in out.open():
+            try:
+                event = json.loads(line)
+            except ValueError:
+                continue
+            if event.get('type') == 'result':
+                final = event
+            if event.get('type') == 'assistant' and event.get('error') == 'rate_limit':
+                quota_error = True
+        text = final.get('result', '') if final else ''
+        if not isinstance(text, str):
+            text = ''
+        # Only the final report is returned to the caller; transcripts remain private.
+        self.a.write_json(directory/f"result-{d['attempt']}.json", {'text': text})
+        if (directory/'cancel').exists():
+            state, reason = 'cancelled', 'Cancelled; inspect partial work before resuming.'
+        elif time.monotonic() >= deadline:
+            state, reason = 'timed_out', 'Time budget reached; inspect partial work before resuming.'
+        elif quota_error:
+            state, reason = 'quota_exhausted', 'Quota exhausted; resume explicitly after reviewing partial work.'
+            # Invalidate our cached reading; no invented reset time.
+            (self.root/'quota'/f'{name}.json').unlink(missing_ok=True)
+            self.a.record_quota(self.a.ROOT/'state', name, 0)
+        elif (final and final.get('session_id') == d['session_id'] and
+              final.get('subtype') == 'success' and not final.get('is_error') and process.returncode == 0):
+            state, reason = 'completed', None
+        else:
+            state, reason = 'failed', 'Claude did not return a successful final result; inspect private job logs.'
+        self.save(d, status=state, reason=reason, returncode=process.returncode,
+                  permission_denials=len(final.get('permission_denials', [])) if final else 0)
+
+
+def schema(properties, required=()):
+    return {'type': 'object', 'properties': properties, 'required': list(required), 'additionalProperties': False}
+
+
+STRING = {'type': 'string'}
+TOOLS = [
+    {'name': 'delegate', 'description': 'Opt-in cross-account task: starts an independent Claude session on a freshly verified available subscription, excluding the parent and disabled accounts. Returns a job_id immediately; use result(wait_seconds=25) to collect its report. No native Agent replacement. Default read-only; project mode follows existing project permissions and denies unattended approval prompts. Does not inherit the parent conversation: include all necessary instructions. No nested agents or MCP tools.',
+     'inputSchema': schema({'prompt': STRING, 'cwd': {**STRING, 'description': 'Absolute working directory; for edits use an isolated worktree.'}, 'title': STRING, 'mode': {'type': 'string', 'enum': ['read-only', 'project'], 'default': 'read-only'}, 'model': STRING, 'max_seconds': {'type': 'integer', 'minimum': 30, 'maximum': 28800, 'default': 3600}}, ('prompt', 'cwd'))},
+    {'name': 'jobs', 'description': 'List recent cross-account jobs, their account, independent session ID and status.', 'inputSchema': schema({})},
+    {'name': 'result', 'description': 'Read a cross-account job report; optionally wait up to 25 seconds. Poll pending jobs with a wait, not a busy loop. A partial/failed report is not completion. next_offset fetches another 24000-character page.', 'inputSchema': schema({'job_id': STRING, 'wait_seconds': {'type': 'number', 'minimum': 0, 'maximum': 25}, 'offset': {'type': 'integer', 'minimum': 0}}, ('job_id',))},
+    {'name': 'resume', 'description': 'Explicitly continue a finished/interrupted job in its same independent session, selecting an available account again. Review existing edits/results first to avoid duplicate actions. Does not resume a native Agent ID.', 'inputSchema': schema({'job_id': STRING, 'prompt': STRING}, ('job_id', 'prompt'))},
+    {'name': 'cancel', 'description': 'Cancel only the specified cross-account job. Leaves history and partial work for inspection; does not affect the parent or other windows.', 'inputSchema': schema({'job_id': STRING}, ('job_id',))},
+]
+
+
+def serve(jobs, source=sys.stdin, sink=sys.stdout):
+    methods = {'delegate': jobs.submit, 'jobs': jobs.listing, 'result': jobs.result, 'resume': jobs.resume, 'cancel': jobs.cancel}
+    for line in source:
+        request_id = None
+        try:
+            request = json.loads(line)
+            if not isinstance(request, dict):
+                raise ValueError('Invalid JSON-RPC request')
+            request_id = request.get('id')
+            if 'id' not in request:
+                continue
+            method = request.get('method')
+            params = request.get('params') or {}
+            if method == 'initialize':
+                version = params.get('protocolVersion')
+                if version not in ('2024-11-05', '2025-03-26', '2025-06-18', '2025-11-25'):
+                    version = '2025-06-18'
+                result = {'protocolVersion': version, 'capabilities': {'tools': {}},
+                          'serverInfo': {'name': 'claude-account-delegation', 'version': '0.1.0'}}
+            elif method == 'ping':
+                result = {}
+            elif method == 'tools/list':
+                result = {'tools': TOOLS}
+            elif method == 'tools/call':
+                try:
+                    name = params.get('name')
+                    if name not in methods:
+                        raise ValueError('Unknown tool')
+                    args = params.get('arguments', {})
+                    if not isinstance(args, dict):
+                        raise ValueError('arguments must be an object')
+                    value = methods[name](**args)
+                    result = {'content': [{'type': 'text', 'text': json.dumps(value, ensure_ascii=False)}]}
+                except (ValueError, TypeError, RuntimeError, OSError) as exc:
+                    message = str(exc) if isinstance(exc, ValueError) else type(exc).__name__
+                    result = {'isError': True, 'content': [{'type': 'text', 'text': message}]}
+            else:
+                sink.write(json.dumps({'jsonrpc': '2.0', 'id': request_id, 'error': {'code': -32601, 'message': 'Method not found'}})+'\n')
+                sink.flush()
+                continue
+            response = {'jsonrpc': '2.0', 'id': request_id, 'result': result}
+        except (ValueError, TypeError, AttributeError):
+            response = {'jsonrpc': '2.0', 'id': request_id, 'error': {'code': -32700, 'message': 'Invalid request'}}
+        sink.write(json.dumps(response, ensure_ascii=False)+'\n')
+        sink.flush()
+
+
+def main():
+    os.umask(0o077)
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('command', choices=('mcp', '_worker'), nargs='?', default='mcp')
+    parser.add_argument('job_id', nargs='?')
+    args = parser.parse_args()
+    jobs = Jobs(*dependencies())
+    if args.command == '_worker':
+        jobs.worker(args.job_id)
+    else:
+        serve(jobs)
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except (KeyboardInterrupt, BrokenPipeError):
+        pass
