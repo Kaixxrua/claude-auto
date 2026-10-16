@@ -6,6 +6,8 @@
 
 管理本机多个 Claude Code 订阅账号，在确认额度耗尽后保存上下文、切换可用账号，并恢复原会话。配套网页额度台展示 5 小时 / 7 天用量、重置时间和重置卡。
 
+可选的[跨账号委派工具](docs/delegation.md)可以把明确指定的任务交给有剩余额度的账号，支持查询结果、取消和保留独立会话续接。它不替换原生 `Agent`。
+
 [English](README.en.md) · [安装与配置](docs/configuration.md) · [故障排查](docs/troubleshooting.md) · [安全说明](SECURITY.md)
 
 这是独立社区项目，运行官方 Claude Code 客户端，未附带或修改其程序。仅管理你有权使用的账号；各账号仍受服务端额度、访问权限及服务条款约束。

@@ -24,7 +24,7 @@ jobs:
           python-version: ${{ matrix.python-version }}
       - name: Syntax checks
         run: |
-          python -m py_compile bin/claude-accounts dashboard/monitor.py dashboard/reset_cards.py scripts/install.py
+          python -m py_compile bin/claude-accounts bin/claude-delegate dashboard/monitor.py dashboard/reset_cards.py scripts/install.py plugins/account-delegation/scripts/server.py
           sh -n bin/claude-auto bin/claude-quota
           node --check dashboard/static/app.js
       - name: Unit, PTY, HTTP and clean-install tests (offline fixtures)

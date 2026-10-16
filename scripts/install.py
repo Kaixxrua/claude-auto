@@ -10,10 +10,11 @@ import sys
 import tempfile
 
 SOURCE = Path(__file__).resolve().parents[1]
-COMMANDS = ('claude-accounts', 'claude-auto', 'claude-quota')
+COMMANDS = ('claude-accounts', 'claude-auto', 'claude-quota', 'claude-delegate')
 ASSETS = ('monitor.py', 'reset_cards.py', 'static/index.html',
           'static/app.js', 'static/style.css', 'static/favicon.svg')
 COMPACTION_ASSETS = ('.claude-plugin/plugin.json', 'hooks/hooks.json', 'hooks/register.js')
+DELEGATION_ASSETS = ('.claude-plugin/plugin.json', '.mcp.json', 'scripts/server.py')
 
 
 def atomic_install(content: bytes, target: Path, mode: int):
@@ -42,6 +43,9 @@ def install(prefix: Path, systemd: bool = False):
     manifest += [(SOURCE/'plugins/compaction-recovery'/name,
                   prefix/'share/claude-auto/compaction-recovery'/name, 0o644)
                  for name in COMPACTION_ASSETS]
+    manifest += [(SOURCE/'plugins/account-delegation'/name,
+                  prefix/'share/claude-auto/account-delegation'/name, 0o644)
+                 for name in DELEGATION_ASSETS]
     manifest.append((SOURCE/'plugins/.claude-plugin/marketplace.json',
                      prefix/'share/claude-auto/.claude-plugin/marketplace.json', 0o644))
     if systemd:
@@ -71,7 +75,7 @@ def main():
         prefix = install(args.prefix, args.systemd)
     except (OSError, ValueError) as exc:
         parser.exit(1, f'Install failed: {exc}\n')
-    print(f'Installed claude-auto, claude-accounts and claude-quota in {prefix / "bin"}')
+    print(f'Installed claude-auto, claude-accounts, claude-quota and claude-delegate in {prefix / "bin"}')
     print('Add that bin directory to PATH, then run: claude-accounts init')
     print('Account data is managed separately by claude-accounts; installation does not initialize it.')
     if args.systemd:
