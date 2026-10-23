@@ -8,6 +8,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 import uuid
 
 from _support import REPO_ROOT, native_fixture
@@ -52,12 +53,13 @@ if name == os.environ['TEST_LAST_ACCOUNT']:
     print('RESUME_OK', flush=True)
     time.sleep(.3)
     sys.exit(0)
-exiting = []
+presses = []
 def exit_cleanly(*_):
-    # The rotation presses Ctrl+C more than once; the first one ends this client.
-    if exiting:
+    # Like Claude Code: the first Ctrl+C only asks for another, the second ends the client.
+    # Ending on the first would start SessionEnd while the rotation's second press arrives.
+    presses.append(1)
+    if len(presses) != 2:
         return
-    exiting.append(1)
     save({'type': 'system', 'data': 'final-flush-before-exit'})
     hook('SessionEnd')
     record({'account': name, 'exit': 'ctrl-c'})
@@ -142,6 +144,17 @@ class OsLayerTests(unittest.TestCase):
         while oslayer.process_start(grandchild) and time.monotonic() < deadline:
             time.sleep(.1)
         self.assertIsNone(oslayer.process_start(grandchild))
+
+    def test_read_bytes_waits_while_a_replaced_file_cannot_be_opened(self):
+        path = self.root/'state.json'
+        refused = PermissionError(13, 'Access is denied')
+        with mock.patch.object(Path, 'read_bytes', side_effect=[refused, refused, b'{}']), \
+                mock.patch.object(oslayer.time, 'sleep') as sleep:
+            self.assertEqual(oslayer.read_bytes(path), b'{}')
+        self.assertEqual(sleep.call_count, 2)
+        with mock.patch.object(Path, 'read_bytes', side_effect=refused), \
+                mock.patch.object(oslayer.time, 'sleep'), self.assertRaises(PermissionError):
+            oslayer.read_bytes(path)
 
     def test_hook_command_uses_the_exec_form(self):
         self.assertEqual(oslayer.hook_command([r'C:\Program Files\Python\python.exe', 'a b', '_hook']),
