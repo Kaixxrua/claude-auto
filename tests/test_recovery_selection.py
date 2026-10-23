@@ -8,6 +8,7 @@ import time
 import unittest
 from unittest.mock import patch
 
+import _support
 import test_claude_accounts as base
 import monitor as m
 
@@ -20,7 +21,7 @@ def windows(at):
 class RecoveryTests(unittest.TestCase):
     def setUp(self):
         self.tmp=tempfile.TemporaryDirectory();self.root=Path(self.tmp.name);self.state=self.root/'state'
-        self.registry={'version':1,'claude':'/bin/true','profiles':{n:str(self.root/n) for n in ('main','second','account07','account09')},'disabled':{'main':{'reason':'banned'}}}
+        self.registry={'version':1,'claude':_support.PROGRAM,'profiles':{n:str(self.root/n) for n in ('main','second','account07','account09')},'disabled':{'main':{'reason':'banned'}}}
         a.write_json(self.root/'accounts.json',self.registry)
         self.root_patch=patch.object(a,'ROOT',self.root);self.root_patch.start()
         self.at=time.time();self.start=self.at-.2;self.windows=windows(self.at)

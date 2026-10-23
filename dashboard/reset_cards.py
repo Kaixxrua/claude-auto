@@ -15,11 +15,18 @@ import os
 from pathlib import Path
 import re
 import subprocess
+import sys
 import threading
 import time
 import urllib.error
 import urllib.request
 import uuid
+
+HERE = Path(__file__).resolve().parent
+# The OS layer: installed in share/claude-auto/lib, or lib/ in a source checkout.
+sys.path.insert(0, str(next((d for d in (HERE.parent/'claude-auto/lib', HERE.parent/'lib')
+                             if (d/'claude_auto_os.py').is_file()), HERE.parent/'lib')))
+import claude_auto_os as oslayer  # noqa: E402
 
 ORIGIN = 'https://api.anthropic.com'
 GRANT_ID = re.compile(r'[a-z0-9_-]{1,40}\Z')
@@ -96,7 +103,7 @@ class OfficialClient:
         if name not in registry['profiles'] or name in registry.get('disabled', {}):
             raise CardError('disabled', '账号不存在或已停用，不会查询或使用卡片')
         try:
-            auth = json.loads((Path(registry['profiles'][name])/'.credentials.json').read_text())['claudeAiOauth']
+            auth = json.loads((Path(registry['profiles'][name])/'.credentials.json').read_bytes())['claudeAiOauth']
             token = auth['accessToken']
             if not isinstance(token, str) or not token or 'user:profile' not in auth.get('scopes', []):
                 raise ValueError()
@@ -220,7 +227,7 @@ class ResetCards:
 
     def load(self, path, journal=False):
         try:
-            value = json.loads(path.read_text())
+            value = json.loads(path.read_bytes())
             if not isinstance(value, dict) or not all(isinstance(v, dict) for v in value.values()):
                 raise ValueError()
             return value
@@ -235,16 +242,13 @@ class ResetCards:
         # Also sync the directory: a restart must not lose a submitted operation.
         tmp = path.with_name('.'+path.name+'-'+uuid.uuid4().hex)
         try:
-            with os.fdopen(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), 'w') as stream:
+            with os.fdopen(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | oslayer.BINARY, 0o600),
+                           'w', encoding='utf-8') as stream:
                 json.dump(value, stream, ensure_ascii=False)
                 stream.flush()
                 os.fsync(stream.fileno())
-            os.replace(tmp, path)
-            fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
-            try:
-                os.fsync(fd)
-            finally:
-                os.close(fd)
+            oslayer.replace(tmp, path)
+            oslayer.sync_directory(path.parent)
         finally:
             tmp.unlink(missing_ok=True)
 

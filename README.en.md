@@ -16,7 +16,7 @@ On Claude Code 2.1.287+, the compaction plugin records native outcomes without a
 
 ## Install
 
-Requires **Linux, Python 3.10+, system timezone data, the official Claude Code CLI, and an interactive terminal**. Runtime dependencies are all in the Python standard library. Automatic switching requires at least two distinct signed-in subscription accounts. Native Windows and macOS are unsupported; WSL has not been separately validated.
+Requires **Linux or Windows 10 1809+ / 11, Python 3.10+, the official Claude Code CLI, and an interactive terminal** (plus system timezone data on Linux). Runtime dependencies are all in the Python standard library. Automatic switching requires at least two distinct signed-in subscription accounts. macOS is unsupported; WSL has not been separately validated. See [Windows](#windows) for the differences there.
 
 Install Claude Code using the [official instructions](https://code.claude.com/docs/en/setup), then:
 
@@ -30,6 +30,21 @@ claude-accounts setup 2
 claude-accounts status
 claude-auto
 ```
+
+### Windows
+
+Use the **native** `claude.exe` from the [official installer](https://code.claude.com/docs/en/setup) (in `%USERPROFILE%\.local\bin` by default); the npm `claude.cmd` is unsupported. In PowerShell or Windows Terminal:
+
+```powershell
+git clone https://github.com/Kaixxrua/claude-auto.git
+cd claude-auto
+python scripts\install.py
+claude-accounts init
+claude-accounts setup 2
+claude-auto
+```
+
+The installer puts `.cmd` commands in `%USERPROFILE%\.local\bin`, which the official installer usually adds to PATH, and pins the Python that ran it. Shared settings files need symbolic links: enable Windows Developer Mode, or run `claude-accounts init` / `add` once from an elevated terminal; shared folders fall back to junctions. The launcher proxies the terminal through ConPTY. Windows has no SIGTERM, so a rotation presses Ctrl+C twice, as a person would, to let the client exit cleanly (twice more if a draft took the first press); it never force-kills. The official client shows reset times in the system time zone on Windows, and the dashboard converts them. `--systemd` is Linux-only; on Windows run `claude-quota` when needed or start it at sign-in with Task Scheduler.
 
 `main` uses your existing `~/.claude` directory. `second` gets its own login directory. The official browser login flow signs each account in; verify the identity during each authorization. Preferences, skills, plugins, and project histories are shared by symlink, so profiles are not security isolation boundaries. Credentials remain separate. Cookie import and API-key substitution are unsupported.
 
@@ -77,7 +92,7 @@ Disabled accounts, duplicate identities, and accounts with known quota cooldowns
 
 Before switching, the launcher drains active tools and verifies saved parent / subagent history. It preserves session and agent identifiers and permission restrictions. An incomplete checkpoint blocks switching. Failed agents and stale task records are reconciled; separately managed, hash-pinned watcher services can be registered as nonblocking.
 
-The initial release was exercised with Claude Code **2.1.295** on Linux. CLI output, hooks, and internal state may change. This is an interactive tool, not a `--print` API wrapper. Native ephemeral features, such as Artifact comment monitors, may need to be restarted through the official client.
+The initial release was exercised with Claude Code **2.1.295** on Linux; Windows support was exercised with native Claude Code **2.1.309** on Windows 11 (terminal proxy, rotation and resume, hooks, status line). CLI output, hooks, and internal state may change. This is an interactive tool, not a `--print` API wrapper. Native ephemeral features, such as Artifact comment monitors, may need to be restarted through the official client.
 
 Reset-card support uses **undocumented Anthropic OAuth endpoints** and is experimental. The module reads an existing access token in memory only when requested, sends it to a fixed Anthropic origin, and never returns it to the browser or refreshes it itself. Redemption requires explicit confirmation and a durable one-shot record; an ambiguous result is never retried automatically. The launcher itself does not read credentials.
 
@@ -91,6 +106,6 @@ python3 scripts/check_release.py
 node --check dashboard/static/app.js
 ```
 
-Tests use temporary profiles, fake upstream clients, real PTYs, and loopback HTTP. No real accounts, tokens, reset cards, or Anthropic requests are required. See [CONTRIBUTING.md](CONTRIBUTING.md); operational documentation and the UI are currently primarily Chinese.
+Tests use temporary profiles, fake upstream clients, real PTYs (ConPTY on Windows), and loopback HTTP. CI runs on Linux with Python 3.10, 3.12 and 3.13 and on Windows with Python 3.10 and 3.13. No real accounts, tokens, reset cards, or Anthropic requests are required. See [CONTRIBUTING.md](CONTRIBUTING.md); operational documentation and the UI are currently primarily Chinese.
 
 Licensed under [Apache-2.0](LICENSE). See [NOTICE](NOTICE) for attribution and trademark information.

@@ -1,12 +1,10 @@
 import importlib.machinery
 import importlib.util
 import io
-import fcntl
 import json
 import multiprocessing
 import os
 from pathlib import Path
-import pty
 import select
 import subprocess
 import sys
@@ -15,7 +13,12 @@ import time
 import unittest
 import uuid
 from unittest import mock
-from _support import REPO_ROOT
+from _support import REPO_ROOT, WINDOWS
+try:
+    import fcntl
+    import pty
+except ImportError:  # Windows: tests/test_windows.py drives the launcher through ConPTY.
+    fcntl = pty = None
 
 MODULE_PATH = REPO_ROOT/'bin/claude-accounts'
 loader = importlib.machinery.SourceFileLoader('accounts', str(MODULE_PATH))
@@ -31,7 +34,7 @@ if sys.argv[1:] == ['auth','status']:
     print(json.dumps({'loggedIn':True,'authMethod':'claude.ai','subscriptionType':'pro','email':name+'@example.test'}))
     sys.exit(0)
 args = sys.argv[1:]
-settings = json.loads(pathlib.Path(args[args.index('--settings')+1]).read_text())
+settings = json.loads(pathlib.Path(args[args.index('--settings')+1]).read_text(encoding='utf-8'))
 sid = os.environ['TEST_SESSION']
 project = pathlib.Path(os.environ['CLAUDE_ACCOUNTS_HOME'])/'main'/'projects'/'fake-project'
 project.mkdir(parents=True,exist_ok=True)
@@ -95,7 +98,7 @@ if (scenario.startswith('login-retry-') or scenario in ('switch','concurrent','s
                 time.sleep(1)
                 assert not select.select([sys.stdin],[],[],0)[0], 'Unexpected continuation after cancellation/exhaustion'
                 run=pathlib.Path(args[args.index('--settings')+1]).parent
-                status=json.loads((run/'retry-status.json').read_text())
+                status=json.loads((run/'retry-status.json').read_text(encoding='utf-8'))
                 assert status['phase'] == ('cancelled' if scenario == 'login-retry-keyboard' else 'exhausted'), status
                 print('CANCEL_OK' if scenario == 'login-retry-keyboard' else 'BUDGET_OK',flush=True)
                 sys.exit(0)
@@ -110,18 +113,18 @@ if (scenario.startswith('login-retry-') or scenario in ('switch','concurrent','s
                 sys.exit(0)
     if scenario in ('subagents','child-only','stale-background'):
         pending_path=pathlib.Path(args[args.index('--settings')+1]).parent/'pending-recovery.json'
-        pending=json.loads(pending_path.read_text())
+        pending=json.loads(pending_path.read_text(encoding='utf-8'))
         assert pending['verified'] is True
         assert pending['pending_agents']==['worker-failed']
-        manifest=json.loads(pathlib.Path(pending['manifest']).read_text())
+        manifest=json.loads(pathlib.Path(pending['manifest']).read_text(encoding='utf-8'))
         assert len(manifest['agents'])==3
         assert manifest['agents']['worker-slow']['state']=='stopped'
         assert manifest['agents']['worker-failed']['state']=='failed'
         for agent in ('worker-slow','worker-failed','worker-done'):
             assert (project/sid/'subagents'/('agent-'+agent+'.jsonl')).is_file()
-        assert 'late-final-output' in (project/sid/'subagents'/'agent-worker-slow.jsonl').read_text()
+        assert 'late-final-output' in (project/sid/'subagents'/'agent-worker-slow.jsonl').read_text(encoding='utf-8')
         hook('SubagentStart',agent_id='worker-failed',agent_type='general-purpose')
-        after=json.loads(pending_path.read_text())
+        after=json.loads(pending_path.read_text(encoding='utf-8'))
         assert after['pending_agents']==[] and after['resumed_agents']==['worker-failed']
     print('RESUME_OK',flush=True)
     time.sleep(.15)
@@ -141,7 +144,7 @@ if scenario == 'banned':
     sys.exit(0)
 if scenario == 'disable-next':
     registry_path=pathlib.Path(os.environ['CLAUDE_ACCOUNTS_HOME'])/'accounts.json'
-    registry=json.loads(registry_path.read_text())
+    registry=json.loads(registry_path.read_text(encoding='utf-8'))
     registry['disabled']={'second':{'reason':'disabled while controller is running'}}
     registry_path.write_text(json.dumps(registry))
 if scenario == 'scratch-links':
@@ -269,7 +272,7 @@ class AccountsTests(unittest.TestCase):
             names=m.prepare_profiles(registry,12)
             self.assertEqual(names,['main','second']+[f'account{i:02d}' for i in range(3,13)])
             self.assertEqual(m.prepare_profiles(registry,12),names)
-            self.assertEqual((base/'.credentials.json').read_text(),'TEST_SECRET_NOT_TO_COPY')
+            self.assertEqual((base/'.credentials.json').read_text(encoding='utf-8'),'TEST_SECRET_NOT_TO_COPY')
             for name in names[1:]:
                 profile=Path(registry['profiles'][name])
                 self.assertFalse((profile/'.credentials.json').exists())
@@ -336,7 +339,7 @@ class AccountsTests(unittest.TestCase):
             m.write_json(state/'quota.json',{'legacy':{'blocked_until':now+900,'recorded_at':now}})
             writes=[(f'account{i:02d}',now+600+i) for i in range(6)]
             writes += [('shared',now+1200+i*60) for i in range(4)]
-            context=multiprocessing.get_context('fork')
+            context=multiprocessing.get_context('spawn' if WINDOWS else 'fork')
             barrier=context.Barrier(len(writes))
             processes=[context.Process(target=write_quota_worker,args=(str(state),name,reset,barrier))
                        for name,reset in writes]
@@ -356,6 +359,8 @@ class AccountsTests(unittest.TestCase):
             self.assertIn('oldsession',quota)
 
     def run_fake(self, scenario, names=('main','second'), blocked_profiles=(), initial='main', disabled_profiles=()):
+        if WINDOWS:
+            self.skipTest('POSIX PTY fixture; tests/test_windows.py rotates through ConPTY')
         with tempfile.TemporaryDirectory() as temp:
             root=Path(temp)
             binary=root/'fake-claude'; binary.write_text(FAKE); binary.chmod(0o700)
@@ -377,7 +382,8 @@ class AccountsTests(unittest.TestCase):
             launcher=MODULE_PATH
             if scenario.startswith('login-retry-'):
                 launcher=root/'test-launcher.py'
-                launcher.write_text(MODULE_PATH.read_text().replace('LOGIN_RETRY_DELAYS = (60, 120)', 'LOGIN_RETRY_DELAYS = (0.3, 0.4)'))
+                launcher.write_text(MODULE_PATH.read_text(encoding='utf-8').replace('LOGIN_RETRY_DELAYS = (60, 120)', 'LOGIN_RETRY_DELAYS = (0.3, 0.4)'))
+                env['PYTHONPATH']=str(REPO_ROOT/'lib')
             if scenario == 'stale-background':
                 project=root/'main/projects/fake-project'; project.mkdir(parents=True)
                 watch=project/'watch.py'; watch.write_text('pass\n')
@@ -413,7 +419,7 @@ class AccountsTests(unittest.TestCase):
                 scratch=Path(tempfile.gettempdir())/('claude-'+str(os.getuid()))/'rotation-test'/env['TEST_SESSION']
                 if scratch.exists(): shutil.rmtree(scratch)
             trace_path=root/'trace.jsonl'
-            trace=[json.loads(line) for line in trace_path.read_text().splitlines()] if trace_path.exists() else []
+            trace=[json.loads(line) for line in trace_path.read_text(encoding='utf-8').splitlines()] if trace_path.exists() else []
             return status,trace,output.decode(errors='replace')
 
     def test_pty_archives_scratch_links_then_resumes(self):
@@ -530,6 +536,7 @@ class AccountsTests(unittest.TestCase):
         self.assertEqual(status,0,output)
         self.assertEqual([x['account'] for x in trace],['second'])
 
+    @unittest.skipIf(WINDOWS, 'POSIX PTY fixture')
     def test_three_controllers_run_and_resume_independently_with_old_lock_held(self):
         with tempfile.TemporaryDirectory() as temp:
             root=Path(temp)
@@ -572,7 +579,7 @@ class AccountsTests(unittest.TestCase):
                             if waited: child['status']=os.waitstatus_to_exitcode(code)
                     for child in children:
                         self.assertEqual(child['status'],0,child['output'].decode(errors='replace'))
-                        trace=[json.loads(line) for line in (root/f"trace-{child['index']}.jsonl").read_text().splitlines()]
+                        trace=[json.loads(line) for line in (root/f"trace-{child['index']}.jsonl").read_text(encoding='utf-8').splitlines()]
                         self.assertEqual([item['account'] for item in trace],['main','second'])
                         self.assertTrue(all(item['session_id']==child['sid'] for item in trace))
                         resumed=trace[1]['args']
@@ -631,7 +638,7 @@ class ContextTests(unittest.TestCase):
 
     def scratch(self):
         import shutil
-        scratch=Path(tempfile.gettempdir())/('claude-'+str(os.getuid()))/'rotation-test'/self.sid/'scratchpad'
+        scratch=m.oslayer.claude_temp_root()/'rotation-test'/self.sid/'scratchpad'
         scratch.mkdir(parents=True)
         self.addCleanup(shutil.rmtree,scratch.parent)
         self.state['scratchpads']=[str(scratch)]
@@ -653,14 +660,14 @@ class ContextTests(unittest.TestCase):
         self.assertEqual(m.restore_missing_context(path,self.registry),3)
         self.assertEqual(os.readlink(scratch/'missing.jsonl'),'../not-present')
         self.assertEqual(m.restore_missing_context(path,self.registry),0)
-        self.assertEqual((secret/'.credentials.json').read_text(),'must-not-be-read')
+        self.assertEqual((secret/'.credentials.json').read_text(encoding='utf-8'),'must-not-be-read')
 
     def test_changed_scratch_link_blocks_recovery_without_overwrite(self):
         scratch=self.scratch();link=scratch/'assets';link.symlink_to(self.project)
         path=self.checkpoint();link.unlink();link.symlink_to(self.root)
         with self.assertRaises(m.ContextNotReady):m.verify_checkpoint(path,live=True)
         with self.assertRaises(m.ContextNotReady):m.restore_missing_context(path,self.registry)
-        self.assertEqual(os.readlink(link),str(self.root))
+        self.assertTrue(link.is_symlink() and os.path.samefile(link,self.root))
 
     def test_scratch_credentials_are_explicitly_excluded_without_reading_or_restoring(self):
         scratch=self.scratch();credential=scratch/'.credentials.json';credential.write_text('test-auth-state')
@@ -796,9 +803,10 @@ class ContextTests(unittest.TestCase):
         archive=checkpoint.parents[2]/'objects'
         self.assertEqual((archive/by_path[str(self.transcript)]['sha256']).read_bytes(),self.original)
         journal=next(item for item in manifest['files'] if item['role']=='hook-journal')
-        self.assertIn(receipt,(archive/journal['sha256']).read_text())
+        self.assertIn(receipt,(archive/journal['sha256']).read_text(encoding='utf-8'))
         self.assertEqual(manifest['resume_options'],['--tools','Read,SendMessage','--permission-mode','plan'])
-        self.assertTrue(all((archive/item['sha256']).stat().st_mode & 0o077 == 0 for item in manifest['files']))
+        if not WINDOWS:
+            self.assertTrue(all((archive/item['sha256']).stat().st_mode & 0o077 == 0 for item in manifest['files']))
 
     def test_append_is_allowed_but_truncation_is_rejected(self):
         checkpoint=self.checkpoint()
@@ -891,7 +899,7 @@ class ContextTests(unittest.TestCase):
 
     def test_corrupted_backup_is_rejected(self):
         checkpoint=self.checkpoint()
-        manifest=json.loads(checkpoint.read_text())
+        manifest=json.loads(checkpoint.read_text(encoding='utf-8'))
         item=manifest['files'][0]
         (checkpoint.parents[2]/'objects'/item['sha256']).write_text('damaged')
         with self.assertRaises(m.ContextNotReady): m.arm_recovery(self.run,checkpoint)
@@ -913,7 +921,7 @@ class ContextTests(unittest.TestCase):
         payload=self.payload('StopFailure',error='rate_limit',last_assistant_message="You've hit your session limit")
         with mock.patch.object(m.sys,'stdin',io.StringIO(json.dumps(payload))), mock.patch.object(m,'load_registry',return_value=self.registry):
             m.native_hook('_hook',self.run,'main')
-        events=[json.loads(line) for line in (self.run/'events.jsonl').read_text().splitlines()]
+        events=[json.loads(line) for line in (self.run/'events.jsonl').read_text(encoding='utf-8').splitlines()]
         self.assertEqual(events[-1]['event'],'LegacyRotationPaused')
         self.assertTrue(self.transcript.exists())
 
@@ -921,11 +929,11 @@ class ContextTests(unittest.TestCase):
         payload=self.payload('StopFailure',agent_id='original',agent_type='general-purpose',error='rate_limit',last_assistant_message="You've hit your session limit")
         with mock.patch.object(m.sys,'stdin',io.StringIO(json.dumps(payload))):
             m.native_hook('_hook',self.run,'main')
-        event=json.loads((self.run/'events.jsonl').read_text().splitlines()[-1])
+        event=json.loads((self.run/'events.jsonl').read_text(encoding='utf-8').splitlines()[-1])
         self.assertEqual(event['event'],'StopFailure')
         self.assertIsNone(event['agent_id'])
         self.assertEqual(event['origin_agent_id'],'original')
-        original=json.loads((self.run/'lifecycle.jsonl').read_text().splitlines()[-1])
+        original=json.loads((self.run/'lifecycle.jsonl').read_text(encoding='utf-8').splitlines()[-1])
         self.assertEqual(original['payload']['agent_id'],'original')
 
     def test_native_internal_failure_is_kept_without_inventing_missing_subagent(self):
@@ -1075,9 +1083,13 @@ class ContextTests(unittest.TestCase):
             m.claim_session(self.sid,456)
 
     def test_no_forced_kill_after_graceful_exit_timeout(self):
-        with mock.patch.object(m.os,'kill') as kill:
-            self.assertFalse(m.terminate_child(12345,99,timeout=0))
-        kill.assert_called_once_with(12345,m.signal.SIGTERM)
+        # The console offers nothing else: no kill or close is reachable from here.
+        console=mock.Mock(spec=['request_exit','exit_code','events','show'])
+        console.exit_code.return_value=None
+        console.events.return_value=[('output',b'still working')]
+        self.assertFalse(m.terminate_child(console,timeout=0.05))
+        console.request_exit.assert_called_once_with()
+        console.show.assert_called_with(b'still working')
 
 
 if __name__=='__main__': unittest.main(verbosity=2)

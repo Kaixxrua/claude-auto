@@ -8,7 +8,6 @@ import calendar
 import contextlib
 import copy
 from datetime import datetime, timedelta, timezone
-import fcntl
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import importlib.machinery
 import importlib.util
@@ -17,22 +16,23 @@ import json
 import math
 import os
 from pathlib import Path
-import pty
 import re
-import select
 import signal
-import struct
-import subprocess
 import sys
-import termios
 import threading
 import time
 from urllib.parse import urlsplit
 import uuid
-from reset_cards import ResetCards, CardError, OfficialClient, timestamp, token
+import zoneinfo
+
+HERE = Path(__file__).resolve().parent
+# The OS layer: installed in share/claude-auto/lib, or lib/ in a source checkout.
+sys.path.insert(0, str(next((d for d in (HERE.parent/'claude-auto/lib', HERE.parent/'lib')
+                             if (d/'claude_auto_os.py').is_file()), HERE.parent/'lib')))
+import claude_auto_os as oslayer  # noqa: E402
+from reset_cards import ResetCards, CardError, OfficialClient, timestamp, token  # noqa: E402
 
 VERSION = '1.1.1'
-HERE = Path(__file__).resolve().parent
 UTC = timezone.utc
 PROFILE_RE = re.compile(r'[a-zA-Z0-9_-]{1,64}\Z')
 ANSI = re.compile(r'\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b\[[0-?]*[ -/]*[@-~]|\x1b[78=>]')
@@ -48,7 +48,7 @@ MONTHS = {name: i for i, name in enumerate(
 
 def load_json(path, default=None):
     try:
-        return json.loads(Path(path).read_text())
+        return json.loads(Path(path).read_bytes())
     except (OSError, ValueError):
         return copy.deepcopy(default)
 
@@ -57,13 +57,13 @@ def save_json(path, value):
     path = Path(path)
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     tmp = path.with_name('.' + path.name + '-' + uuid.uuid4().hex)
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | oslayer.BINARY, 0o600)
     try:
-        with os.fdopen(fd, 'w') as stream:
+        with os.fdopen(fd, 'w', encoding='utf-8') as stream:
             json.dump(value, stream, ensure_ascii=False)
             stream.flush()
             os.fsync(stream.fileno())
-        os.replace(tmp, path)
+        oslayer.replace(tmp, path)
     finally:
         with contextlib.suppress(FileNotFoundError):
             tmp.unlink()
@@ -87,12 +87,8 @@ _plan_cache = {}
 
 
 def process_ticks(pid):
-    """Linux start ticks, compared the same way claude-delegate does, so a reused PID never counts as the job."""
-    try:
-        fields = Path(f'/proc/{int(pid)}/stat').read_text().rsplit(')', 1)[1].split()
-        return None if fields[0] == 'Z' else fields[19]
-    except (OSError, ValueError, IndexError, TypeError):
-        return None
+    """Process start time, compared the same way claude-delegate does, so a reused PID never counts as the job."""
+    return oslayer.process_start(pid)
 
 
 def session_limits(path, tail=1 << 20):
@@ -208,7 +204,7 @@ def oauth_windows(payload, at):
 def token_expiry(registry, name):
     """Expiry of the stored login, read without using the token."""
     with contextlib.suppress(OSError, ValueError, KeyError, TypeError):
-        auth = json.loads((Path(registry['profiles'][name])/'.credentials.json').read_text())['claudeAiOauth']
+        auth = json.loads((Path(registry['profiles'][name])/'.credentials.json').read_bytes())['claudeAiOauth']
         if finite(auth.get('expiresAt')):
             return auth['expiresAt']/1000
     return None
@@ -287,24 +283,39 @@ def official_usage(registry, name, client_factory=OfficialClient):
     return identity['email'], oauth_windows(payload, time.time())
 
 
+def reset_zone(name):
+    """The zone /usage names: (UTC) as requested on Linux. Claude Code on Windows ignores TZ and
+    shows the system zone, which Python there may lack without tzdata; local time is that zone.
+    None means local time; False an unrecognized name."""
+    if name.upper() == 'UTC':
+        return UTC
+    try:
+        return zoneinfo.ZoneInfo(name)
+    except (zoneinfo.ZoneInfoNotFoundError, ValueError, OSError):
+        return None if re.fullmatch(r'[A-Za-z]+(?:/[\w+-]+)+', name) else False
+
+
 def parse_reset(text, now, window):
-    """Native /usage renders minute precision; the process is explicitly in UTC."""
+    """Native /usage renders minute precision in the named zone."""
     match = re.fullmatch(
         r'Resets (?:(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) (\d{1,2}), )?'
-        r'(\d{1,2})(?::(\d{2}))?(am|pm) \(UTC\)', text.strip(), re.I)
+        r'(\d{1,2})(?::(\d{2}))?(am|pm) \(([\w/+-]{1,64})\)', text.strip(), re.I)
     if not match:
         return None
-    month, day, hour, minute, half = match.groups()
+    month, day, hour, minute, half, zone = match.groups()
     hour, minute = int(hour), int(minute or 0)
     if not 1 <= hour <= 12 or not 0 <= minute < 60:
         return None
+    zone = reset_zone(zone)
+    if zone is False:
+        return None
     hour = hour % 12 + (12 if half.lower() == 'pm' else 0)
-    dt = datetime.fromtimestamp(now, UTC)
+    dt = datetime.fromtimestamp(now, zone)
     if month:
         candidates = []
         for year in (dt.year - 1, dt.year, dt.year + 1):
             with contextlib.suppress(ValueError):
-                candidates.append(datetime(year, MONTHS[month.title()], int(day), hour, minute, tzinfo=UTC))
+                candidates.append(datetime(year, MONTHS[month.title()], int(day), hour, minute, tzinfo=zone))
         candidates = [item for item in candidates if -120 <= (item - dt).total_seconds() <= 8 * 86400]
         return min(candidates, key=lambda item: abs((item-dt).total_seconds())).timestamp() if candidates else None
     target = dt.replace(hour=hour, minute=minute, second=0, microsecond=0)
@@ -352,28 +363,21 @@ def probe_usage(binary, env, cwd, stop_event=None, timeout=18):
     """Open only /usage in a separate client; no continue/resume or model prompt."""
     env = dict(env)
     env.update(TERM='xterm-256color', TZ='UTC', LANG='C.UTF-8', LC_ALL='C.UTF-8')
-    master, slave = pty.openpty()
-    fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', 80, 220, 0, 0))
-    process = None
     output = bytearray()
     windows = {}
     found_at = None
+    terminal = oslayer.Terminal([binary, '--safe-mode', '--strict-mcp-config', '--ax-screen-reader',
+                                 '--tools', '', '--', '/usage'], env, cwd, cols=220, rows=80)
     try:
-        process = subprocess.Popen(
-            [binary, '--safe-mode', '--strict-mcp-config', '--ax-screen-reader',
-             '--tools', '', '--', '/usage'], cwd=cwd, env=env, stdin=slave, stdout=slave,
-            stderr=slave, start_new_session=True)
-        os.close(slave)
-        slave = None
         deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline and process.poll() is None:
+        while time.monotonic() < deadline and terminal.poll() is None:
             if stop_event and stop_event.is_set():
                 raise ProbeError('服务正在停止')
-            if select.select([master], [], [], .15)[0]:
-                try:
-                    output.extend(os.read(master, 65536))
-                except OSError:
-                    break
+            data = terminal.read(.15)
+            if data == b'':
+                break
+            if data:
+                output.extend(data)
                 if len(output) > 2_000_000:
                     raise ProbeError('官方客户端输出异常，已停止此次查询')
                 windows = parse_usage(output.decode(errors='replace'))
@@ -391,17 +395,8 @@ def probe_usage(binary, env, cwd, stop_event=None, timeout=18):
             raise ProbeError('官方 /usage 未返回可识别的额度（网络、登录或客户端格式变化）')
         return windows
     finally:
-        if slave is not None:
-            os.close(slave)
-        if process is not None and process.poll() is None:
-            process.terminate()
-            try:
-                process.wait(timeout=8)
-            except subprocess.TimeoutExpired:
-                # This is our fresh read-only probe, never a user's work session.
-                os.killpg(process.pid, signal.SIGKILL)
-                process.wait(timeout=3)
-        os.close(master)
+        # This is our fresh read-only probe, never a user's work session.
+        terminal.close()
 
 
 def probe_complete(binary, env, cwd, stop_event=None, known=None):
@@ -719,17 +714,11 @@ class Monitor:
         """Identify our existing native clients by their settings path, not tokens."""
         result = {}
         root = (self.root/'state/runs').resolve()
-        for proc in Path('/proc').iterdir():
-            if not proc.name.isdigit():
-                continue
+        for _, args in oslayer.commands('claude'):
             try:
-                if proc.stat().st_uid != os.getuid():
+                if '--settings' not in args:
                     continue
-                args = (proc/'cmdline').read_bytes().split(b'\0')
-                if not args or Path(os.fsdecode(args[0])).name != 'claude' or b'--settings' not in args:
-                    continue
-                index = args.index(b'--settings') + 1
-                path = Path(os.fsdecode(args[index])).resolve()
+                path = Path(args[args.index('--settings') + 1]).resolve()
                 if path.parent.parent != root or not path.name.endswith('-settings.json'):
                     continue
                 name = path.name[:-len('-settings.json')]
@@ -993,15 +982,14 @@ def main():
     if not 0 <= args.port <= 65535:
         parser.error('--port must be between 0 and 65535')
     os.umask(0o077)
+    oslayer.utf8_stdio()
     adapter = load_account_module(args.adapter)
     adapter.ROOT = args.root.expanduser().resolve()
     args.root = adapter.ROOT
     monitor = Monitor(args.root, adapter, args.cwd, args.interval)
     # One collector service, independent of every Claude work session.
-    lock_fd = os.open(monitor.state_dir/'collector.lock', os.O_CREAT | os.O_RDWR, 0o600)
-    try:
-        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:
+    lock_fd = os.open(monitor.state_dir/'collector.lock', os.O_CREAT | os.O_RDWR | oslayer.BINARY, 0o600)
+    if not oslayer.lock(lock_fd, blocking=False):
         raise SystemExit('已有监控服务在运行')
     if args.once:
         for name in monitor.registry['profiles']:
@@ -1022,6 +1010,8 @@ def main():
 
     signal.signal(signal.SIGTERM, shutdown)
     signal.signal(signal.SIGINT, shutdown)
+    if hasattr(signal, 'SIGBREAK'):
+        signal.signal(signal.SIGBREAK, shutdown)
     print(f'Claude quota monitor listening on http://{args.bind}:{server.server_port}', flush=True)
     try:
         server.serve_forever(poll_interval=.3)

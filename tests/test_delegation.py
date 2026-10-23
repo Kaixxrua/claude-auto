@@ -13,15 +13,17 @@ import unittest
 from unittest import mock
 import uuid
 
-from _support import REPO_ROOT
+from _support import REPO_ROOT, WINDOWS, link_directory, native_fixture
 import monitor
 
+# On Windows os.kill ends a process at once whatever the signal.
+KILL = getattr(signal, 'SIGKILL', signal.SIGTERM)
 
 FAKE = r'''#!/usr/bin/env python3
 import json, os, pathlib, sys, time
 root = pathlib.Path(os.environ['CLAUDE_ACCOUNTS_HOME'])
 profile = pathlib.Path(os.environ['CLAUDE_CONFIG_DIR'])
-options = json.loads((profile/'fixture.json').read_text())
+options = json.loads((profile/'fixture.json').read_bytes())
 with (root/'fixture-calls.jsonl').open('a') as trace:
     trace.write(json.dumps({'account': profile.name, 'args': sys.argv[1:]})+'\n')
 if sys.argv[1:] == ['auth', 'status']:
@@ -49,7 +51,7 @@ resuming = '--resume' in sys.argv
 sid = sys.argv[sys.argv.index('--resume' if resuming else '--session-id')+1]
 history = profile/'projects'/'fixture'/f'{sid}.jsonl'
 history.parent.mkdir(parents=True, exist_ok=True)
-previous = history.read_text() if history.exists() else ''
+previous = history.read_text(encoding='utf-8') if history.exists() else ''
 if resuming:
     assert previous, 'resume lost history'
 with history.open('a') as f: f.write(json.dumps({'type':'user','content':prompt})+'\n')
@@ -88,16 +90,14 @@ class DelegationTests(unittest.TestCase):
         self.home.mkdir()
         self.project = self.base/'project with spaces'
         self.project.mkdir()
-        self.native = self.base/'native'
-        self.native.write_text(FAKE)
-        self.native.chmod(0o755)
+        self.native = native_fixture(self.base/'native', FAKE)
         self.history = self.root/'shared-projects'
         self.history.mkdir()
         profiles = {}
         for name in ('parent', 'full', 'alpha', 'beta', 'main'):
             p = self.root/name
             p.mkdir()
-            (p/'projects').symlink_to(self.history)
+            link_directory(p/'projects', self.history)
             (p/'fixture.json').write_text(json.dumps({'email': name+'@example.test', 'used': 100 if name=='full' else 0}))
             profiles[name] = str(p)
         self.registry = {'version':1, 'claude':str(self.native), 'profiles':profiles,
@@ -118,12 +118,11 @@ class DelegationTests(unittest.TestCase):
 
     def cleanup_processes(self):
         for p in (self.jobs.root/'jobs').glob('*/job.json'):
-            d = json.loads(p.read_text())
+            d = json.loads(p.read_bytes())
             for kind in ('native', 'worker'):
                 pid = d.get(kind+'_pid')
                 if pid and self.m.process_start(pid) == d.get(kind+'_start'):
-                    with contextlib.suppress(ProcessLookupError):
-                        os.killpg(pid, signal.SIGTERM)
+                    self.m.oslayer.stop_group(pid)
 
     def submit(self, prompt='Do a read-only task', **kwargs):
         return self.jobs.submit(prompt=prompt, cwd=str(self.project), **kwargs)
@@ -140,14 +139,14 @@ class DelegationTests(unittest.TestCase):
 
     def calls(self):
         p=self.root/'fixture-calls.jsonl'
-        return [json.loads(s) for s in p.read_text().splitlines()] if p.exists() else []
+        return [json.loads(s) for s in p.read_text(encoding='utf-8').splitlines()] if p.exists() else []
 
     def policy(self, **values):
         self.a.write_json(self.jobs.root/'policy.json', values)
 
     def fixture(self, name, **options):
         p=self.root/name/'fixture.json'
-        p.write_text(json.dumps({**json.loads(p.read_text()), **options}))
+        p.write_text(json.dumps({**json.loads(p.read_bytes()), **options}))
 
     def runs(self):
         return [c for c in self.calls() if '-p' in c['args']]
@@ -196,7 +195,8 @@ class DelegationTests(unittest.TestCase):
         names={c['account'] for c in self.calls()}
         self.assertNotIn('main',names)
         self.assertFalse(any(c['account'] in ('parent','full') and '-p' in c['args'] for c in self.calls()))
-        self.assertEqual((self.jobs.directory(job['job_id'])/'job.json').stat().st_mode & 0o777,0o600)
+        if not WINDOWS:
+            self.assertEqual((self.jobs.directory(job['job_id'])/'job.json').stat().st_mode & 0o777,0o600)
         args=next(c['args'] for c in self.calls() if '-p' in c['args'])
         self.assertIn('--safe-mode',args)
         self.assertEqual(args[args.index('--tools')+1],'Read,Glob,Grep')
@@ -211,7 +211,7 @@ class DelegationTests(unittest.TestCase):
 
     def test_worker_crash_keeps_native_lease_and_allows_cancel(self):
         first=self.submit('WAIT one');a=self.until(first['job_id'],{'running'})
-        os.kill(a['worker_pid'],signal.SIGKILL)
+        os.kill(a['worker_pid'],KILL)
         self.until(first['job_id'],{'interrupted'})
         with self.assertRaisesRegex(ValueError,'still running'):
             self.jobs.resume(first['job_id'],'Continue')
@@ -410,7 +410,7 @@ class DelegationTests(unittest.TestCase):
         self.assertIn('--resume',self.runs()[1]['args'])
         self.assertEqual(self.jobs.result(job['job_id'])['text'],'resumed with prior context')
         self.assertEqual((d['attempts'][0]['status'],d['attempts'][0]['kind']),('quota_exhausted','quota'))
-        session=json.loads((self.jobs.root/'quota/session/alpha.json').read_text())
+        session=json.loads((self.jobs.root/'quota/session/alpha.json').read_bytes())
         self.assertEqual(session['windows']['five_hour']['used_percentage'],100)
 
     def test_continuation_limit_leaves_job_for_review(self):
@@ -508,7 +508,7 @@ class DelegationTests(unittest.TestCase):
     def test_supervisor_continues_after_worker_and_session_died(self):
         self.policy(auto_continue=True)
         job=self.submit('WAIT then finish');d=self.until(job['job_id'],{'running'})
-        os.kill(d['worker_pid'],signal.SIGKILL);os.killpg(d['native_pid'],signal.SIGKILL)
+        os.kill(d['worker_pid'],KILL);self.m.oslayer.kill_group(d['native_pid'])
         self.until(job['job_id'],{'interrupted'})
         deadline=time.monotonic()+5
         while self.m.process_start(d['native_pid'])==d['native_start'] and time.monotonic()<deadline:time.sleep(.05)
@@ -542,7 +542,7 @@ class DelegationTests(unittest.TestCase):
         with mock.patch.object(self.probe,'PROBE_RETRY_SECONDS',0):
             d=self.run_worker_inline()
         self.assertEqual((d['status'],d['account']),('completed','alpha'),d)
-        windows=json.loads((self.jobs.root/'quota/alpha.json').read_text())['windows']
+        windows=json.loads((self.jobs.root/'quota/alpha.json').read_bytes())['windows']
         self.assertEqual(windows['five_hour']['inferred'],'session_not_started')
 
     def test_missing_session_window_without_history_is_not_guessed(self):
@@ -593,7 +593,7 @@ class WakeTests(unittest.TestCase):
 
     def client(self):
         """A stand-in client process that the test can end."""
-        p = subprocess.Popen(['sleep', '60'])
+        p = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])
         self.addCleanup(lambda: (p.kill(), p.wait()))
         return p, (p.pid, self.m.process_start(p.pid))
 
@@ -674,8 +674,7 @@ class WakeTests(unittest.TestCase):
         self.jobs.a.private_dir(directory)
         fd = os.open(directory/f'sess-a.{self.me[0]}.wait', os.O_CREAT | os.O_RDWR, 0o600)
         self.addCleanup(os.close, fd)
-        import fcntl
-        fcntl.flock(fd, fcntl.LOCK_EX)
+        self.m.oslayer.lock(fd)
         self.job()
         self.assertEqual(self.jobs.wake('sess-a', self.scopes, self.me, hook=True, poll=.05, seconds=1), 0)
         d = self.job(status='running')
@@ -688,20 +687,23 @@ class WakeTests(unittest.TestCase):
         settings.parent.mkdir()
         other = {'hooks': [{'type': 'command', 'command': 'echo other'}]}
         settings.write_text(json.dumps({'permissions': {'allow': ['Bash']}, 'hooks': {'Stop': [other]}}))
-        settings.chmod(0o640)
+        if not WINDOWS:
+            settings.chmod(0o640)
         for _ in range(2):
             self.jobs.wake_hook('install', str(self.project))
-        value = json.loads(settings.read_text())
+        value = json.loads(settings.read_bytes())
         self.assertEqual(value['permissions'], {'allow': ['Bash']})
         self.assertIn(other, value['hooks']['Stop'])
         for event in self.m.WAKE_EVENTS:
-            ours = [h for g in value['hooks'][event] for h in g['hooks'] if h['command'].endswith(' _wake')]
+            # The exec form on Windows keeps the arguments apart.
+            ours = [h for g in value['hooks'][event] for h in g['hooks'] if (h.get('args') or h['command'].split())[-1] == '_wake']
             self.assertEqual(len(ours), 1)
             self.assertTrue(ours[0]['asyncRewake']); self.assertLess(ours[0]['timeout']*1000, 2**31-1)
-        self.assertEqual(settings.stat().st_mode & 0o777, 0o640)
+        if not WINDOWS:
+            self.assertEqual(settings.stat().st_mode & 0o777, 0o640)
         self.assertIn('installed', self.jobs.wake_hook('status', str(self.project))[0])
         self.jobs.wake_hook('uninstall', str(self.project))
-        value = json.loads(settings.read_text())
+        value = json.loads(settings.read_bytes())
         self.assertEqual(value['hooks'], {'Stop': [other]})
         self.assertIn('not installed', self.jobs.wake_hook('status', str(self.project))[0])
 
@@ -709,7 +711,7 @@ class WakeTests(unittest.TestCase):
         report = self.jobs.wake_hook('install')
         self.assertEqual(len(report), 2)
         for name in ('one', 'two'):
-            value = json.loads((self.root/name/'settings.json').read_text())
+            value = json.loads((self.root/name/'settings.json').read_bytes())
             self.assertEqual(set(value['hooks']), set(self.m.WAKE_EVENTS))
 
     def test_submit_records_the_parent_session(self):

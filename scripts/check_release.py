@@ -13,7 +13,7 @@ import sys
 ROOT = Path(__file__).resolve().parents[1]
 TOP_FILES = {'.gitattributes', '.gitignore', 'README.md', 'README.en.md', 'LICENSE',
              'NOTICE', 'SECURITY.md', 'CONTRIBUTING.md', 'CHANGELOG.md'}
-TOP_DIRS = {'bin', 'dashboard', 'docs', 'examples', 'scripts', 'tests', 'plugins', '.github'}
+TOP_DIRS = {'bin', 'dashboard', 'docs', 'examples', 'lib', 'scripts', 'tests', 'plugins', '.github'}
 PRIVATE_NAMES = {'.claude', '.claude-accounts', '.credentials.json', 'accounts.json',
                  'persistent-watchers.json', 'state', 'logs', '__pycache__', '.env'}
 SECRET_PATTERNS = {
@@ -22,7 +22,7 @@ SECRET_PATTERNS = {
     'private key': re.compile(r'-----BEGIN ' + r'(?:[A-Z]+ )?PRIVATE KEY-----'),
     'literal access/refresh token': re.compile(
         r'''(?i)(?:access_?token|refresh_?token|api_?key|oauth_?token)["']?\s*[:=]\s*["']([A-Za-z0-9_+/=.-]{32,})["']'''),
-    'personal absolute home path': re.compile(r'/(?:home|Users)/[A-Za-z0-9_.-]+/'),
+    'personal absolute home path': re.compile(r'/(?:home|Users)/[^/\s"\'<>$]+/|\\{1,2}Users\\{1,2}[^\\\s"\'<>%]+\\'),
 }
 EMAIL = re.compile(r'\b[A-Za-z0-9_.+-]+@(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,}\b')
 

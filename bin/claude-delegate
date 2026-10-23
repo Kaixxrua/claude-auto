@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import argparse
 import contextlib
-import fcntl
 import hashlib
 import importlib.machinery
 import importlib.util
@@ -15,7 +14,6 @@ import mmap
 import os
 from pathlib import Path
 import re
-import shlex
 import signal
 import subprocess
 import sys
@@ -25,6 +23,10 @@ import time
 import uuid
 
 SCRIPT = Path(__file__).resolve()
+# The OS layer: installed in share/claude-auto/lib, or lib/ in a source checkout.
+sys.path.insert(0, str(next((d for d in (SCRIPT.parent.parent/'share/claude-auto/lib', SCRIPT.parent.parent/'lib')
+                             if (d/'claude_auto_os.py').is_file()), SCRIPT.parent.parent/'lib')))
+import claude_auto_os as oslayer  # noqa: E402
 TERMINAL = {'completed', 'failed', 'blocked', 'cancelled', 'timed_out', 'quota_exhausted', 'interrupted',
             'model_mismatch'}
 JOB_ID = re.compile(r'[a-f0-9]{32}\Z')
@@ -104,19 +106,12 @@ def identity(status):
 
 
 def process_start(pid):
-    """PID plus Linux start ticks prevents signaling or adopting a reused PID."""
-    try:
-        fields = Path(f'/proc/{int(pid)}/stat').read_text().rsplit(')', 1)[1].split()
-        return None if fields[0] == 'Z' else fields[19]
-    except (OSError, ValueError, IndexError, TypeError):
-        return None
+    """PID plus its start time prevents signaling or adopting a reused PID."""
+    return oslayer.process_start(pid)
 
 
 def parent_pid(pid):
-    try:
-        return int(Path(f'/proc/{int(pid)}/stat').read_text().rsplit(')', 1)[1].split()[1])
-    except (OSError, ValueError, IndexError, TypeError):
-        return 0
+    return oslayer.parent_pid(pid)
 
 
 def client_process():
@@ -126,6 +121,17 @@ def client_process():
     for _ in range(8):
         if pid <= 1:
             return None
+        if oslayer.WINDOWS:
+            # Another process's terminal cannot be inspected here; print and SDK sessions
+            # are told apart by their arguments.
+            args = oslayer.process_args(pid) or []
+            if args and Path(args[0]).name.lower() in ('claude', 'claude.exe'):
+                if {'-p', '--print', '--input-format', '--output-format'} & set(args):
+                    return None
+                start = process_start(pid)
+                return (pid, start) if start else None
+            pid = parent_pid(pid)
+            continue
         try:
             args = Path(f'/proc/{pid}/cmdline').read_bytes().split(b'\0')
             exe = Path(os.readlink(f'/proc/{pid}/exe')).name
@@ -242,16 +248,21 @@ def stop_kind(final, errors, returncode):
 @contextlib.contextmanager
 def lease(path):
     """A kernel lease is released even when the owning worker crashes."""
-    fd = os.open(path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    fd = oslayer.exclusive(path)
     try:
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            yield False
-        else:
-            yield fd
+        yield False if fd is None else fd
     finally:
-        os.close(fd)
+        if fd is not None:
+            os.close(fd)
+
+
+def try_lock(path):
+    """An open, exclusively locked file, or None while another process holds it."""
+    fd = os.open(path, os.O_CREAT | os.O_RDWR | oslayer.NOFOLLOW | oslayer.BINARY, 0o600)
+    if oslayer.lock(fd, blocking=False):
+        return fd
+    os.close(fd)
+    return None
 
 
 class Jobs:
@@ -328,7 +339,7 @@ class Jobs:
             os.chmod(log.name, 0o600)
             process = subprocess.Popen([sys.executable, str(SCRIPT), '_worker', d['job_id']],
                                        stdin=subprocess.DEVNULL, stdout=log, stderr=log,
-                                       env=env, start_new_session=True, close_fds=True)
+                                       env=env, close_fds=True, **oslayer.detached())
         self.save(d, worker_pid=process.pid, worker_start=process_start(process.pid))
         threading.Thread(target=process.wait, daemon=True).start()
         # Worker takes the job lock after the caller has written its PID.
@@ -484,12 +495,9 @@ class Jobs:
         return started
 
     def supervise(self, interval=30, once=False):
-        fd = os.open(self.root/'supervisor.lock', os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            os.close(fd)
-            raise SystemExit('Another delegation supervisor is running') from None
+        fd = try_lock(self.root/'supervisor.lock')
+        if fd is None:
+            raise SystemExit('Another delegation supervisor is running')
         stop = threading.Event()
         for sig in (signal.SIGTERM, signal.SIGINT):
             signal.signal(sig, lambda *_: stop.set())
@@ -611,12 +619,10 @@ class Jobs:
         directory = self.root/'wake'
         self.a.private_dir(directory)
         self.wake_cleanup(directory)
-        fd = os.open(directory/f'{session_id}.{client[0]}.wait', os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+        fd = try_lock(directory/f'{session_id}.{client[0]}.wait')
+        if fd is None:
+            return 0
         try:
-            try:
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError:
-                return 0
             deadline = time.monotonic()+seconds if seconds else math.inf
             while process_start(client[0]) == client[1]:
                 if lines := self.wake_round(session_id, scopes, client, transcript):
@@ -640,11 +646,15 @@ class Jobs:
             targets = [Path(p)/'settings.json' for p in self.a.load_registry()['profiles'].values()]
         # A shared settings file is changed once, through its link.
         targets = list(dict.fromkeys(t.resolve() if t.is_symlink() else t for t in targets))
-        entry = {'type': 'command', 'command': shlex.join([sys.executable, str(SCRIPT), '_wake']),
+        entry = {'type': 'command', **oslayer.hook_command([sys.executable, str(SCRIPT), '_wake']),
                  'asyncRewake': True, 'timeout': WAKE_HOOK_TIMEOUT,
                  'rewakeMessage': '委派任务有新进展（claude-delegate）：', 'rewakeSummary': '委派任务有新进展'}
         def ours(hook):
             command = hook.get('command') if isinstance(hook, dict) else None
+            args = hook.get('args') if isinstance(hook, dict) else None
+            if isinstance(args, list) and args:
+                # The exec form used on Windows.
+                return args[-1] == '_wake' and any('claude-delegate' in str(a) for a in args[:-1])
             return isinstance(command, str) and 'claude-delegate' in command and command.endswith(' _wake')
         report = []
         for path in targets:
@@ -688,7 +698,7 @@ class Jobs:
                     json.dump(settings, stream, ensure_ascii=False, indent=2)
                     stream.write('\n')
                 os.chmod(temporary, mode)
-                os.replace(temporary, path)
+                oslayer.replace(temporary, path)
             finally:
                 with contextlib.suppress(FileNotFoundError):
                     os.unlink(temporary)
@@ -700,18 +710,16 @@ class Jobs:
             d = self.read(job_id)
             pid = d.get('native_pid')
             if (d['status'] == 'interrupted' and pid and
-                    process_start(pid) == d.get('native_start') and os.getpgid(pid) == pid):
+                    process_start(pid) == d.get('native_start') and oslayer.group_leader(pid)):
                 # A worker crash must not leave an uncancellable orphan. Both
                 # PID birth and the dedicated process group must still match.
                 self.a.write_json(self.directory(job_id)/'cancel', {'at': time.time()})
-                with contextlib.suppress(ProcessLookupError):
-                    os.killpg(pid, signal.SIGTERM)
+                oslayer.stop_group(pid)
                 deadline = time.monotonic()+10
                 while process_start(pid) == d.get('native_start') and time.monotonic() < deadline:
                     time.sleep(.1)
                 if process_start(pid) == d.get('native_start'):
-                    with contextlib.suppress(ProcessLookupError):
-                        os.killpg(pid, signal.SIGKILL)
+                    oslayer.kill_group(pid)
                 self.save(d, status='cancelled', reason='Cancelled this job after its worker exited.')
                 return self.public(d)
             if d['status'] not in TERMINAL or d['status'] == 'interrupted':
@@ -862,16 +870,11 @@ class Jobs:
     def interactive_accounts(self, registry):
         """Accounts with an interactive client started by claude-accounts, found by its settings path."""
         result, runs = set(), (self.a.ROOT/'state/runs').resolve()
-        for proc in Path('/proc').iterdir():
-            if not proc.name.isdigit():
-                continue
+        for _, args in oslayer.commands('claude'):
             try:
-                if proc.stat().st_uid != os.getuid():
+                if '--settings' not in args:
                     continue
-                args = (proc/'cmdline').read_bytes().split(b'\0')
-                if not args or Path(os.fsdecode(args[0])).name != 'claude' or b'--settings' not in args:
-                    continue
-                path = Path(os.fsdecode(args[args.index(b'--settings')+1])).resolve()
+                path = Path(args[args.index('--settings')+1]).resolve()
                 if path.parent.parent == runs and path.name.endswith('-settings.json'):
                     name = path.name[:-len('-settings.json')]
                     if name in registry['profiles']:
@@ -884,7 +887,7 @@ class Jobs:
     def selection_lock(self, stop):
         """One worker chooses at a time, so two picks cannot land on the same account unseen.
         Yields a release function (called once the chosen Claude process runs), or None on stop."""
-        fd = os.open(self.root/'leases'/'select.lock', os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+        fd = os.open(self.root/'leases'/'select.lock', os.O_CREAT | os.O_RDWR | oslayer.NOFOLLOW | oslayer.BINARY, 0o600)
         held = [True]
         def release():
             if held[0]:
@@ -893,10 +896,9 @@ class Jobs:
         try:
             acquired = False
             while not acquired and not stop.is_set():
-                try:
-                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                if oslayer.lock(fd, blocking=False):
                     acquired = True
-                except BlockingIOError:
+                else:
                     stop.wait(.2)
             yield release if acquired else None
         finally:
@@ -1139,8 +1141,8 @@ class Jobs:
         cap, since = d.get('cap'), time.time()
         with prompt.open('rb') as stdin, out.open('wb') as stdout, err.open('wb') as stderr, out.open('rb') as events:
             out.chmod(0o600); err.chmod(0o600)
-            process = subprocess.Popen(args, env=env, cwd=d['cwd'], stdin=stdin,
-                                       stdout=stdout, stderr=stderr, start_new_session=True, pass_fds=lease_fds)
+            process = subprocess.Popen(args, env=env, cwd=d['cwd'], stdin=stdin, stdout=stdout, stderr=stderr,
+                                       **oslayer.detached(), **oslayer.inherit(lease_fds))
             began = time.monotonic()
             budget['deadline'] = began+max(0, d['max_seconds']-d.get('run_seconds', 0))
             self.save(d, status='running', native_pid=process.pid, native_start=process_start(process.pid), history_root=history_root)
@@ -1150,13 +1152,12 @@ class Jobs:
                 heartbeat = time.monotonic()
                 while process.poll() is None:
                     if stop.wait(.2) or mismatch or capped:
-                        with contextlib.suppress(ProcessLookupError):
-                            os.killpg(process.pid, signal.SIGTERM)
+                        oslayer.stop_group(process.pid)
                         try:
                             process.wait(timeout=10)
                         except subprocess.TimeoutExpired:
                             # Only this job's own process group; never another window.
-                            os.killpg(process.pid, signal.SIGKILL)
+                            oslayer.kill_group(process.pid)
                             process.wait(timeout=5)
                         break
                     pending, found = self.scan_events(events, pending, d, expected)
@@ -1278,10 +1279,10 @@ def serve(jobs, source=sys.stdin, sink=sys.stdout):
         sink.flush()
 
 
-def wake_from_hook(source=sys.stdin):
+def wake_from_hook(source=None):
     """SessionStart/Stop hook with asyncRewake: exit code 2 shows the notices to the model."""
     try:
-        payload = json.load(source)
+        payload = json.loads(oslayer.stdin_bytes() if source is None else source.read())
     except (ValueError, OSError):
         return 0
     # Checked before loading anything, so print-mode sessions return at once.
@@ -1296,6 +1297,7 @@ def wake_from_hook(source=sys.stdin):
 
 def main():
     os.umask(0o077)
+    oslayer.utf8_stdio()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('command', choices=('mcp', '_worker', 'supervise', 'wait', '_wake', 'wake-hook'),
                         nargs='?', default='mcp')
@@ -1308,6 +1310,9 @@ def main():
     parser.add_argument('--project', help="wake-hook: this project's .claude/settings.local.json instead of every account")
     args = parser.parse_args()
     if args.command == '_wake':
+        if oslayer.WINDOWS:
+            # Ctrl+C reaches every process in the client's console; the waiter ends with the client.
+            signal.signal(signal.SIGINT, signal.SIG_IGN)
         return wake_from_hook()
     jobs = Jobs(*dependencies())
     if args.command == '_worker':

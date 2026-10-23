@@ -29,6 +29,8 @@ python3 scripts/install.py --prefix /path/to/local
 
 从源码直接运行也可以：`./bin/claude-accounts`、`./bin/claude-auto`、`./bin/claude-quota`。
 
+Windows 上安装的是 `claude-accounts`、`claude-delegate` 两个 Python 脚本和四个 `.cmd` 命令（`claude-accounts.cmd`、`claude-auto.cmd`、`claude-quota.cmd`、`claude-delegate.cmd`），不安装 sh 包装脚本。`.cmd` 和委派插件的 `.mcp.json` 记录运行安装器的 Python 解释器路径；换用其他 Python 后重新运行安装器。各平台共用的系统差异层安装在 `share/claude-auto/lib/claude_auto_os.py`。
+
 ## 账号目录
 
 通过环境变量指定注册表和运行状态的根目录，启动器与额度台均遵守此设置：

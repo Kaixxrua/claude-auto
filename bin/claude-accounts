@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-"""Local Claude Code account launcher. Python standard library; Linux only.
+"""Local Claude Code account launcher. Python standard library; Linux and Windows.
 
 Uses official CLAUDE_CONFIG_DIR, auth login/status, hooks and --resume.
 Never reads, copies, edits or exports .credentials.json.
@@ -11,14 +11,12 @@ import argparse
 import contextlib
 import copy
 import datetime
-import errno
 import hashlib
 import json
 import math
 import os
 from pathlib import Path
 import re
-import select
 import shlex
 import shutil
 import signal
@@ -32,6 +30,10 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 ROOT = Path(os.environ.get("CLAUDE_ACCOUNTS_HOME", str(Path.home() / ".claude-accounts")))
 SCRIPT = Path(__file__).resolve()
+# The OS layer: installed in share/claude-auto/lib, or lib/ in a source checkout.
+sys.path.insert(0, str(next((d for d in (SCRIPT.parent.parent / "share/claude-auto/lib", SCRIPT.parent.parent / "lib")
+                             if (d / "claude_auto_os.py").is_file()), SCRIPT.parent.parent / "lib")))
+import claude_auto_os as oslayer  # noqa: E402
 VERSION = "2026-10-10.4"
 DISABLED_UNTIL = 253402300799
 SHARED = ("settings.json", "settings.local.json", "CLAUDE.md", "projects", "agents",
@@ -79,7 +81,7 @@ def write_json(path, value):
             stream.write("\n")
             stream.flush()
             os.fsync(stream.fileno())
-        os.replace(temporary, path)
+        oslayer.replace(temporary, path)
         sync_directory(path.parent)
     finally:
         with contextlib.suppress(FileNotFoundError):
@@ -87,21 +89,16 @@ def write_json(path, value):
 
 
 def sync_directory(path):
-    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
-    try:
-        os.fsync(fd)
-    finally:
-        os.close(fd)
+    oslayer.sync_directory(path)
 
 
 @contextlib.contextmanager
 def state_lock(path):
     """Lock only a short state-file update, never a running Claude session."""
-    import fcntl
     private_dir(path.parent)
-    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
-    with os.fdopen(fd, "a+") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
+    fd = os.open(path, os.O_RDWR | os.O_CREAT | oslayer.BINARY, 0o600)
+    with os.fdopen(fd, "a+b") as lock:
+        oslayer.lock(lock)
         yield
 
 
@@ -157,28 +154,56 @@ def add_profile(registry, name):
     target = ROOT / name
     if target.exists():
         raise RuntimeError(f"目录已存在且未注册，不会覆盖：{target}")
-    private_dir(target)
     base = Path(registry["profiles"]["main"])
     (base / "projects").mkdir(exist_ok=True)
+    if oslayer.WINDOWS and any((base / item).is_file() for item in SHARED):
+        symlink_check(ROOT)
+    private_dir(target)
     for item in SHARED:
         source = base / item
         if source.exists():
-            (target / item).symlink_to(source, target_is_directory=source.is_dir())
+            link_shared(source, target / item)
     registry["profiles"][name] = str(target)
     write_json(ROOT / "accounts.json", registry)
     return target
+
+
+def symlink_check(directory):
+    """Windows creates symbolic links only in Developer Mode or an elevated shell."""
+    private_dir(directory)
+    probe = directory / (".link-check-" + uuid.uuid4().hex)
+    try:
+        probe.symlink_to(directory / "accounts.json")
+    except OSError:
+        raise RuntimeError("账号之间共享设置文件需要符号链接：请在 Windows 设置中打开「开发者模式」，"
+                           "或在管理员终端运行本命令一次。") from None
+    probe.unlink()
+
+
+def link_shared(source, target):
+    """Share one main-profile item. Without the symbolic-link right, Windows shares a
+    folder through a junction, which needs no privilege."""
+    try:
+        target.symlink_to(source, target_is_directory=source.is_dir())
+    except OSError:
+        if not (oslayer.WINDOWS and source.is_dir()):
+            raise
+        import _winapi
+        _winapi.CreateJunction(str(source), str(target))
 
 
 def init():
     private_dir(ROOT)
     if (ROOT / "accounts.json").exists():
         return load_registry()
-    binary = Path.home() / ".local/bin/claude"
+    binary = Path.home() / ".local/bin" / ("claude.exe" if oslayer.WINDOWS else "claude")
     if not binary.is_file():
         found = shutil.which("claude")
         if not found:
             raise RuntimeError("请先安装官方 Claude Code。")
         binary = Path(found)
+    if oslayer.WINDOWS and binary.suffix.lower() != ".exe":
+        raise RuntimeError("Windows 上需要官方原生安装的 claude.exe；npm 安装的 claude.cmd 不受支持。")
     base = Path.home() / ".claude"
     base.mkdir(mode=0o700, exist_ok=True)
     registry = {"version": 1, "claude": str(binary),
@@ -222,7 +247,7 @@ def auth_status(registry, name):
     try:
         result = subprocess.run([registry["claude"], "auth", "status"],
                                 env=profile_env(registry, name), capture_output=True,
-                                text=True, timeout=20)
+                                text=True, encoding="utf-8", errors="replace", timeout=20)
         data = json.loads(result.stdout)
         if not isinstance(data, dict):
             return {"loggedIn": False, "error": "InvalidAuthStatus"}
@@ -334,7 +359,7 @@ def inherit_preferences_locked(registry, name):
 
 def append_record(path, value):
     data = (json.dumps(value, ensure_ascii=False) + "\n").encode("utf-8")
-    fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+    fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | oslayer.BINARY, 0o600)
     try:
         view = memoryview(data)
         while view:
@@ -365,13 +390,13 @@ def account_unavailable(event):
 
 
 def process_identity(pid):
-    try:
-        return (Path("/proc") / str(pid) / "stat").read_text().rsplit(") ", 1)[1].split()[19]
-    except (OSError, IndexError):
-        return None
+    return oslayer.process_start(pid)
 
 
 def legacy_session_owners(session_id):
+    # Launchers from before the context-safe controller existed only on Linux.
+    if oslayer.WINDOWS:
+        return []
     owners = []
     for proc in Path("/proc").iterdir():
         if not proc.name.isdigit() or int(proc.name) == os.getpid():
@@ -389,7 +414,7 @@ def legacy_session_owners(session_id):
                 if (target.parent / "launch.json").exists():
                     continue
                 current = None
-                for line in target.read_text().splitlines():
+                for line in target.read_text(encoding="utf-8", errors="replace").splitlines():
                     with contextlib.suppress(ValueError):
                         event = json.loads(line)
                         if event.get("event") == "SessionStart":
@@ -831,7 +856,7 @@ def context_sources(registry, state):
     add_tree(transcript.with_suffix(""), "session-files")
     for directory in registry["profiles"].values():
         add_tree(Path(directory) / "tasks" / sid, "tasks")
-    temp_root = (Path(tempfile.gettempdir()) / ("claude-" + str(os.getuid()))).resolve()
+    temp_root = oslayer.claude_temp_root().resolve()
     for directory in state.get("scratchpads", []):
         path = Path(directory).resolve()
         if not path.is_relative_to(temp_root) or sid not in path.parts:
@@ -862,9 +887,7 @@ _CONTEXT_ARCHIVES = {}
 
 
 def context_stamp(path):
-    info = path.lstat()
-    return (info.st_dev, info.st_ino, info.st_mode, info.st_size,
-            info.st_mtime_ns, info.st_ctime_ns)
+    return oslayer.path_stamp(path)
 
 
 def context_hash(path, limit=None):
@@ -883,7 +906,7 @@ def context_hash(path, limit=None):
     # that exact hash state only while the entire file's identity is unchanged.
     offset = max((n for n in states if n < length), default=0)
     digest = states[offset].copy() if offset in states else hashlib.sha256()
-    with os.fdopen(os.open(path, os.O_RDONLY | os.O_NOFOLLOW), "rb") as stream:
+    with os.fdopen(os.open(path, os.O_RDONLY | oslayer.NOFOLLOW | oslayer.BINARY), "rb") as stream:
         stream.seek(offset)
         remaining = length - offset
         while remaining:
@@ -892,9 +915,7 @@ def context_hash(path, limit=None):
                 raise ContextNotReady("上下文在校验时被截断：" + str(path))
             digest.update(chunk)
             remaining -= len(chunk)
-        info = os.fstat(stream.fileno())
-        opened = (info.st_dev, info.st_ino, info.st_mode, info.st_size,
-                  info.st_mtime_ns, info.st_ctime_ns)
+        opened = oslayer.fd_stamp(stream.fileno())
     if opened != before or context_stamp(path) != before:
         raise ContextNotReady("上下文仍在写入，稍后重新校验：" + str(path))
     if len(_CONTEXT_HASHES) >= 100000:
@@ -948,7 +969,7 @@ def archive_file(source, archive_root, allow_symlink=False, allow_historical_err
                     outgoing.write(chunk)
                     copied.update(chunk)
                 else:
-                    with os.fdopen(os.open(source, os.O_RDONLY | os.O_NOFOLLOW), "rb") as incoming:
+                    with os.fdopen(os.open(source, os.O_RDONLY | oslayer.NOFOLLOW | oslayer.BINARY), "rb") as incoming:
                         while chunk := incoming.read(1024 * 1024):
                             outgoing.write(chunk)
                             copied.update(chunk)
@@ -956,7 +977,7 @@ def archive_file(source, archive_root, allow_symlink=False, allow_historical_err
                 os.fsync(outgoing.fileno())
             if copied.hexdigest() != key or context_stamp(source) != before:
                 raise ContextNotReady("上下文仍在写入，稍后重新保存：" + str(source))
-            os.replace(temporary, target)
+            oslayer.replace(temporary, target)
             sync_directory(target.parent)
             # Read back each newly written object once before caching its proof.
             if context_hash(target) != key:
@@ -993,7 +1014,7 @@ def archive_file(source, archive_root, allow_symlink=False, allow_historical_err
                 offset += len(line)
         if warning_count and (last_invalid or not valid):
             raise ContextNotReady("上下文末尾记录尚未通过 JSON 校验：" + source.name)
-    if context_stamp(source) != before or size != before[3] or (link and os.readlink(source) != link_text):
+    if context_stamp(source) != before or (os.readlink(source) != link_text if link else size != before[3]):
         raise ContextNotReady("上下文仍在写入，稍后重新保存：" + str(source))
     item = {"source": str(source), "sha256": key, "size": size}
     if warning_count:
@@ -1084,7 +1105,7 @@ def verify_checkpoint(path, live=False):
             raise ContextNotReady("上下文备份损坏或缺失：" + item["source"])
         if item.get("kind") == "symlink":
             source = Path(item["source"])
-            temp_root = (Path(tempfile.gettempdir()) / ("claude-" + str(os.getuid()))).resolve()
+            temp_root = oslayer.claude_temp_root().resolve()
             if (item["role"] != "scratchpad" or not source.is_absolute()
                     or source.parent.resolve() != source.parent or not source.is_relative_to(temp_root)
                     or manifest["session_id"] not in source.parts or source.name == ".credentials.json"
@@ -1113,7 +1134,7 @@ def restore_missing_context(path, registry):
     if main.name != sid + ".jsonl" or not any(main.is_relative_to(root) for root in roots):
         raise ContextNotReady("备份的原会话路径不在当前配置中。")
     task_roots = [(Path(directory) / "tasks" / sid).resolve() for directory in registry["profiles"].values()]
-    temp_root = (Path(tempfile.gettempdir()) / ("claude-" + str(os.getuid()))).resolve()
+    temp_root = oslayer.claude_temp_root().resolve()
     missing = []
     link_paths = {Path(item["source"]) for item in manifest["files"] if item.get("kind") == "symlink"}
     for item in manifest["files"]:
@@ -1139,7 +1160,9 @@ def restore_missing_context(path, registry):
         target = Path(item["source"])
         private_dir(target.parent)
         if item.get("kind") == "symlink":
-            os.symlink(item["link_target"], target)
+            # Windows makes a link to a folder only when told the target is one.
+            os.symlink(item["link_target"], target,
+                       target_is_directory=(target.parent / item["link_target"]).is_dir())
             sync_directory(target.parent)
             continue
         fd, temporary = tempfile.mkstemp(prefix=".restore-", dir=target.parent)
@@ -1224,7 +1247,7 @@ def safe_limits(limits):
 
 
 def native_hook(kind, run_dir, account):
-    payload = json.load(sys.stdin)
+    payload = json.loads(oslayer.stdin_bytes())
     if kind == "_status":
         value = {"at": time.time(), "account": account,
                  "session_id": payload.get("session_id"),
@@ -1253,8 +1276,10 @@ def native_hook(kind, run_dir, account):
         old = read_json(run_dir / "previous-statusline.json", {})
         if isinstance(old, dict) and old.get("type") == "command" and old.get("command"):
             try:
-                previous = subprocess.run(old["command"], shell=True, input=json.dumps(payload),
-                                          capture_output=True, text=True, timeout=5)
+                # Through the shell Claude Code itself uses for status lines.
+                previous = subprocess.run(oslayer.shell_argv(old["command"]) if oslayer.WINDOWS else old["command"],
+                                          shell=not oslayer.WINDOWS, input=json.dumps(payload), capture_output=True,
+                                          text=True, encoding="utf-8", errors="replace", timeout=5)
                 if previous.returncode == 0 and previous.stdout.strip():
                     print(previous.stdout.rstrip(), end=" | ")
             except subprocess.SubprocessError:
@@ -1490,9 +1515,9 @@ def selection_candidates(registry, names, current, attempted, quotas, after=Fals
 
 
 def overlay_settings(run_dir, account, registry):
-    command = shlex.join([sys.executable, str(SCRIPT), "_hook", str(run_dir), account])
-    status_command = shlex.join([sys.executable, str(SCRIPT), "_status", str(run_dir), account])
-    value = {"hooks": {name: [{"hooks": [{"type": "command", "command": command, "timeout": 15}]}]
+    command = oslayer.hook_command([sys.executable, str(SCRIPT), "_hook", str(run_dir), account])
+    status_command = oslayer.shell_line([sys.executable, str(SCRIPT), "_status", str(run_dir), account])
+    value = {"hooks": {name: [{"hooks": [{"type": "command", **command, "timeout": 15}]}]
                        for name in LIFECYCLE},
         "statusLine": {"type": "command", "command": status_command}}
     original = read_json(Path(registry["profiles"][account]) / "settings.json", {})
@@ -1520,8 +1545,8 @@ def compaction_plugin_arguments(binary, profile=None):
     if plugin is None:
         return []
     try:
-        result = subprocess.run([str(binary), "--version"], capture_output=True,
-                                text=True, timeout=10, check=True)
+        result = subprocess.run([str(binary), "--version"], capture_output=True, text=True,
+                                encoding="utf-8", errors="replace", timeout=10, check=True)
         version = re.search(r"\b(\d+)\.(\d+)\.(\d+)\b", result.stdout)
         if not version or tuple(map(int, version.groups())) < (2, 1, 287):
             say("压缩恢复插件需要 Claude Code 2.1.287+；本次保留原版压缩行为。")
@@ -1582,26 +1607,17 @@ def resume_arguments(claude_args, session_id, manifest_path=None):
     return persistent_arguments(claude_args) + ["--resume", session_id, prompt]
 
 
-def terminate_child(pid, fd, timeout=30):
-    """Request exit without SIGKILL: a stuck process must not lose its buffers."""
-    with contextlib.suppress(ProcessLookupError):
-        os.kill(pid, signal.SIGTERM)
+def terminate_child(console, timeout=30):
+    """Request exit without a forced kill: a stuck process must not lose its buffers."""
+    console.request_exit()
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        try:
-            waited, _ = os.waitpid(pid, os.WNOHANG)
-            if waited:
-                return True
-        except ChildProcessError:
+        if console.exit_code() is not None:
             return True
-        ready, _, _ = select.select([fd], [], [], 0.1)
-        if ready:
-            try:
-                chunk = os.read(fd, 65536)
+        with contextlib.suppress(OSError):
+            for _, chunk in console.events(0.1, keyboard=False):
                 if chunk:
-                    os.write(sys.stdout.fileno(), chunk)
-            except OSError:
-                pass
+                    console.show(chunk)
     say("原进程尚未退出；未强制终止。")
     return False
 
@@ -1829,19 +1845,7 @@ class RecoveryRetry:
 
 
 def interactive_child(command, env, events, account, run_dir, registry):
-    import fcntl
-    import pty
-    import termios
-    import tty
-    pid, fd = pty.fork()
-    if pid == 0:
-        try:
-            os.execvpe(command[0], command, env)
-        except Exception as exc:
-            print(str(exc), file=sys.stderr, flush=True)
-            os._exit(127)
-    saved = termios.tcgetattr(sys.stdin.fileno())
-    prior_winch = signal.getsignal(signal.SIGWINCH)
+    console = oslayer.console(command, env)
     reaped = False
     session_id = None
     pending_event = ""
@@ -1862,18 +1866,11 @@ def interactive_child(command, env, events, account, run_dir, registry):
         write_json(run_dir / "rotation-status.json", value)
         append_record(run_dir / "rotation-timings.jsonl", value)
 
-    def resize(*_):
-        with contextlib.suppress(OSError):
-            size = fcntl.ioctl(sys.stdin.fileno(), termios.TIOCGWINSZ, b"\0" * 8)
-            fcntl.ioctl(fd, termios.TIOCSWINSZ, size)
-
     try:
-        resize()
-        signal.signal(signal.SIGWINCH, resize)
-        tty.setraw(sys.stdin.fileno())
+        console.raw()
         while True:
-            waited, status = os.waitpid(pid, os.WNOHANG)
-            if waited:
+            exit_code = console.exit_code()
+            if exit_code is not None:
                 reaped = True
             # Process hooks even when Claude exits immediately after publishing one.
             pending_event += events.read()
@@ -1946,7 +1943,7 @@ def interactive_child(command, env, events, account, run_dir, registry):
                             checkpoint = checkpoint_context(registry, state, run_dir, "before-exit")
                             write_json(run_dir / "last-checkpoint.json", {"manifest": str(checkpoint)})
                             # Only ask the idle process to exit; never force-kill it.
-                            os.kill(pid, signal.SIGTERM)
+                            console.request_exit()
                             shutdown_requested = True
                             rotation_status("waiting-exit", manifest=str(checkpoint))
                             last_notice = time.monotonic()
@@ -1970,47 +1967,32 @@ def interactive_child(command, env, events, account, run_dir, registry):
                         last_notice = time.monotonic()
             if reaped:
                 # Drain available final output before restoring the terminal.
-                while select.select([fd], [], [], 0)[0]:
-                    try:
-                        chunk = os.read(fd, 65536)
-                    except OSError:
-                        break
-                    if not chunk:
-                        break
-                    os.write(sys.stdout.fileno(), chunk)
-                return {"rotate": False, "exit_code": os.waitstatus_to_exitcode(status)}
-            ready, _, _ = select.select([sys.stdin.fileno(), fd], [], [], 0.15)
-            for source in ready:
-                try:
-                    data = os.read(source, 65536)
-                except OSError as exc:
-                    if source == fd and exc.errno == errno.EIO:
-                        continue
-                    raise
+                console.drain()
+                return {"rotate": False, "exit_code": exit_code}
+            for source, data in console.events(0.15):
                 if not data:
-                    if source == sys.stdin.fileno():
+                    if source == "input":
                         return {"rotate": False, "exit_code": 0}
                     continue
-                if source == sys.stdin.fileno() and not terminal_response_only(data):
+                if source == "input" and not terminal_response_only(data):
                     retry.keyboard(data)
-                os.write(fd if source == sys.stdin.fileno() else sys.stdout.fileno(), data)
+                (console.send if source == "input" else console.show)(data)
             # Process hook receipts and actual keyboard input before considering a
             # retry. Never type over a user's draft or a still-running task.
             if retry.due() and not rotation and not session_blocked:
                 if pending_event or os.fstat(events.fileno()).st_size != events.tell():
                     continue
-                if select.select([sys.stdin.fileno()], [], [], 0)[0]:
+                if console.typing():
                     continue
                 if retry.can_submit(registry):
-                    os.write(fd, ("\x1b[200~" + retry.prompt + "\x1b[201~\r").encode("utf-8"))
+                    console.send(("\x1b[200~" + retry.prompt + "\x1b[201~\r").encode("utf-8"))
                     retry.submitted()
     finally:
         retry.finish("client-exited")
-        termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, saved)
-        signal.signal(signal.SIGWINCH, prior_winch)
+        console.restore()
         if not reaped:
-            terminate_child(pid, fd)
-        os.close(fd)
+            terminate_child(console)
+        console.close()
 
 
 def controller(registry, initial, claude_args):
@@ -2114,9 +2096,14 @@ def controller(registry, initial, claude_args):
 
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
+    oslayer.utf8_stdio()
     if argv and argv[0] in ("_hook", "_status"):
         if len(argv) != 3:
             return 2
+        if oslayer.WINDOWS:
+            # Ctrl+C reaches every process in the client's console, hooks included: one
+            # pressed to clear a draft, or to end the client, must not cut a record short.
+            signal.signal(signal.SIGINT, signal.SIG_IGN)
         native_hook(argv[0], Path(argv[1]), argv[2])
         return 0
     parser = argparse.ArgumentParser(description="官方 Claude Code 的本地多账号启动器（无第三方依赖）。")
@@ -2214,6 +2201,14 @@ def main(argv=None):
             if not eligible(auth_status(registry, options.name)):
                 raise RuntimeError(f"先运行 claude-accounts login {options.name}。")
             inherit_preferences(registry, options.name)
+            if oslayer.WINDOWS:
+                # Windows exec starts a separate process and returns to the shell at once.
+                previous = signal.signal(signal.SIGINT, signal.SIG_IGN)
+                try:
+                    return subprocess.run([registry["claude"]] + args,
+                                          env=profile_env(registry, options.name)).returncode
+                finally:
+                    signal.signal(signal.SIGINT, previous)
             os.execvpe(registry["claude"], [registry["claude"]] + args,
                        profile_env(registry, options.name))
         return controller(registry, options.account, args)
@@ -2224,7 +2219,10 @@ if __name__ == "__main__":
     def stopped(signum, frame):
         raise KeyboardInterrupt
     signal.signal(signal.SIGTERM, stopped)
-    signal.signal(signal.SIGHUP, stopped)
+    # SIGHUP: the terminal closed; SIGBREAK: Ctrl+Break in a Windows console.
+    for name in ("SIGHUP", "SIGBREAK"):
+        if hasattr(signal, name):
+            signal.signal(getattr(signal, name), stopped)
     try:
         sys.exit(main())
     except KeyboardInterrupt:

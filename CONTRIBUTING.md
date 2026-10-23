@@ -1,17 +1,17 @@
 # Contributing
 
-Use Linux with Python 3.10+ and the system timezone database. The launcher and dashboard use the standard library; the optional compaction mod runs inside Claude Code. Node.js is needed for JavaScript checks and mod tests. Automated tests do not require Claude Code, a subscription, or external credentials.
+Use Linux with Python 3.10+ and the system timezone database, or Windows 10 1809+ / 11 with Python 3.10+. The launcher and dashboard use the standard library; the optional compaction mod runs inside Claude Code. Node.js is needed for JavaScript checks and mod tests. Automated tests do not require Claude Code, a subscription, or external credentials.
 
 ```bash
 python3 -m unittest discover -s tests -v
-python3 -m py_compile bin/claude-accounts bin/claude-delegate dashboard/monitor.py dashboard/reset_cards.py scripts/install.py plugins/account-delegation/scripts/server.py
+python3 -m py_compile bin/claude-accounts bin/claude-delegate dashboard/monitor.py dashboard/reset_cards.py scripts/install.py plugins/account-delegation/scripts/server.py lib/claude_auto_os.py
 sh -n bin/claude-auto bin/claude-quota
 node --check dashboard/static/app.js
 node --test tests/test_compaction.mjs
 python3 scripts/check_release.py
 ```
 
-The suite exercises real PTYs with a fake upstream CLI, concurrent controllers, checkpoint integrity, account selection, login lock handling, reset-card confirmation/idempotency, Host/Origin checks, and a fresh installation with a loopback HTTP server. Tests isolate account files in temporary directories. A passing mock suite does not establish compatibility with a new upstream CLI release; report the version when performing an opt-in manual check.
+Platform differences (process identity, locks, leases, process groups, terminals) live in `lib/claude_auto_os.py`; `tests/test_windows.py` covers them and a full rotation through ConPTY on Windows, where the PTY tests are skipped. The suite exercises real PTYs with a fake upstream CLI, concurrent controllers, checkpoint integrity, account selection, login lock handling, reset-card confirmation/idempotency, Host/Origin checks, and a fresh installation with a loopback HTTP server. Tests isolate account files in temporary directories. A passing mock suite does not establish compatibility with a new upstream CLI release; report the version when performing an opt-in manual check.
 
 Delegation tests also cover MCP messages, concurrent identity leases, disabled/unknown/exhausted accounts, cancellation, worker crashes and native session resumption across accounts. They never require live subscriptions.
 

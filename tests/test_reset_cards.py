@@ -53,7 +53,7 @@ class FakeClient:
 class CardTests(unittest.TestCase):
     def setUp(self):
         self.tmp=tempfile.TemporaryDirectory();self.root=Path(self.tmp.name)
-        self.registry={'version':1,'claude':'/bin/true','profiles':{'account06':str(self.root/'account06'),'main':str(self.root/'main')},'disabled':{'main':{'reason':'封禁'}}}
+        self.registry={'version':1,'claude':_support.PROGRAM,'profiles':{'account06':str(self.root/'account06'),'main':str(self.root/'main')},'disabled':{'main':{'reason':'封禁'}}}
         m.save_json(self.root/'accounts.json',self.registry)
         self.mon=m.Monitor(self.root,Adapter(),self.root)
         self.fake=FakeClient();self.mon.reset_cards=r.ResetCards(self.mon,lambda *_:self.fake)
@@ -185,7 +185,8 @@ class CardTests(unittest.TestCase):
         self.assertEqual(self.cards.use(token,True)['result'],'reset')
         resumed=r.ResetCards(self.mon,lambda *_:self.fake)
         self.assertEqual(resumed.use(token,True)['result'],'reset');self.assertEqual(len(self.fake.calls),1)
-        for p in (self.cards.inventory_path,self.cards.journal_path):self.assertEqual(p.stat().st_mode&0o077,0)
+        if not _support.WINDOWS:
+            for p in (self.cards.inventory_path,self.cards.journal_path):self.assertEqual(p.stat().st_mode&0o077,0)
 
     def test_concurrent_double_click_sends_one_request(self):
         token=self.prepare();self.fake.enter=threading.Event();self.fake.release=threading.Event()
@@ -302,7 +303,7 @@ class TransportTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             root=Path(td);secret='secret-test-access-token'
             (root/'.credentials.json').write_text(json.dumps({'claudeAiOauth':{'accessToken':secret,'scopes':['user:profile']}}))
-            registry={'profiles':{'account06':td},'claude':'/bin/true'}
+            registry={'profiles':{'account06':td},'claude':_support.PROGRAM}
             with patch.object(r,'client_version',return_value='2.1.295'):
                 client=r.OfficialClient(registry,'account06')
             requests=[]
@@ -328,7 +329,7 @@ class TransportTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             (Path(td)/'.credentials.json').write_text(json.dumps({'claudeAiOauth':{'accessToken':'secret','scopes':['user:profile']}}))
             with patch.object(r,'client_version',return_value='2.1.295'):
-                client=r.OfficialClient({'profiles':{'account06':td},'claude':'/bin/true'},'account06')
+                client=r.OfficialClient({'profiles':{'account06':td},'claude':_support.PROGRAM},'account06')
             profile={'account':{'uuid':IDENTITY['account_id'],'email':IDENTITY['email']},
                      'organization':{'uuid':IDENTITY['organization_id'],'organization_type':'claude_pro',
                                      'billing_type':'apple_subscription','subscription_status':'<b>active</b>',
@@ -346,6 +347,6 @@ class TransportTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             (Path(td)/'.credentials.json').write_text(json.dumps({'claudeAiOauth':{'accessToken':'secret','scopes':[]}}))
             with patch.object(r.urllib.request,'build_opener',side_effect=AssertionError('network')):
-                with self.assertRaises(r.CardError):r.OfficialClient({'profiles':{'a':td},'claude':'/bin/true'},'a')
+                with self.assertRaises(r.CardError):r.OfficialClient({'profiles':{'a':td},'claude':_support.PROGRAM},'a')
 
 if __name__=='__main__':unittest.main(verbosity=2)

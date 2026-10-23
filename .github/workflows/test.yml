@@ -24,12 +24,35 @@ jobs:
           python-version: ${{ matrix.python-version }}
       - name: Syntax checks
         run: |
-          python -m py_compile bin/claude-accounts bin/claude-delegate dashboard/monitor.py dashboard/reset_cards.py scripts/install.py plugins/account-delegation/scripts/server.py
+          python -m py_compile bin/claude-accounts bin/claude-delegate dashboard/monitor.py dashboard/reset_cards.py scripts/install.py plugins/account-delegation/scripts/server.py lib/claude_auto_os.py
           sh -n bin/claude-auto bin/claude-quota
           node --check dashboard/static/app.js
       - name: Unit, PTY, HTTP and clean-install tests (offline fixtures)
         run: python -m unittest discover -s tests -v
       - name: Compaction recovery tests (offline public API fixtures)
         run: node --test tests/test_compaction.mjs
+      - name: Verify distributable files
+        run: python scripts/check_release.py
+
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.10', '3.13']
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Syntax checks
+        run: python -m py_compile bin/claude-accounts bin/claude-delegate dashboard/monitor.py dashboard/reset_cards.py scripts/install.py plugins/account-delegation/scripts/server.py lib/claude_auto_os.py
+      - name: Unit, ConPTY, HTTP and clean-install tests (offline fixtures)
+        env:
+          PYTHONIOENCODING: utf-8
+        run: python -m unittest discover -s tests -v
       - name: Verify distributable files
         run: python scripts/check_release.py

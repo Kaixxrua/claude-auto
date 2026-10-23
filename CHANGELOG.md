@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Add native Windows support (Windows 10 1809+ / 11, native `claude.exe`). A new standard-library OS layer, `lib/claude_auto_os.py`, covers process identity, locks and leases, process groups and terminals: the launcher proxies the client through ConPTY and ends it for a rotation with Ctrl+C presses instead of SIGTERM; delegated jobs run detached and are stopped with Ctrl+Break; the dashboard reads `/usage` through ConPTY and converts reset times shown in the system time zone. Hooks use the exec form on Windows, the installer writes `.cmd` commands and pins the interpreter in the delegation plugin, and shared profile folders fall back to junctions. Context stamps read the Windows change time so restored-mtime rewrites are still caught. Linux behavior is unchanged. CI adds Windows jobs.
+
 - Add optional cross-account delegation tools: verified quota and identity selection, exclusive account leases, independent native sessions, results, cancellation and explicit resumption. Preserve the native Agent tool and existing project permissions; default delegated tasks to read-only.
 
 - Avoid rewriting existing context objects and reuse process-local verification proofs for unchanged files during account rotation. Keep full history, final flushes and original agent identifiers; inode, device, mode, size, mtime or ctime changes invalidate cached proofs.

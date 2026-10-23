@@ -43,7 +43,7 @@ class CheckpointCacheTests(unittest.TestCase):
         with self.assertRaises(m.ContextNotReady):
             m.verify_checkpoint(checkpoint, live=True)
         fresh = self.checkpoint()
-        self.assertNotEqual(json.loads(checkpoint.read_text())['files'], json.loads(fresh.read_text())['files'])
+        self.assertNotEqual(json.loads(checkpoint.read_text(encoding='utf-8'))['files'], json.loads(fresh.read_text(encoding='utf-8'))['files'])
 
     def test_rewrite_with_restored_mtime_invalidates_backup_proof(self):
         checkpoint = self.checkpoint()

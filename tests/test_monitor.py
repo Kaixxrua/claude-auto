@@ -37,7 +37,7 @@ class MonitorTests(unittest.TestCase):
         patch.start();self.addCleanup(patch.stop)
         self.temp=tempfile.TemporaryDirectory()
         self.root=Path(self.temp.name)
-        m.save_json(self.root/'accounts.json',{'version':1,'claude':'/bin/true','profiles':{'main':str(self.root/'main')}})
+        m.save_json(self.root/'accounts.json',{'version':1,'claude':_support.PROGRAM,'profiles':{'main':str(self.root/'main')}})
         self.mon=m.Monitor(self.root,Adapter(),self.root)
         self.mon.records={'main':{'loggedIn':True,'email':'main@example.test','checked_at':time.time(),
                                   'windows':{'five_hour':{'used_percentage':80,'resets_at':time.time()+3600,'observed_at':time.time(),'source':'official_cli_usage'},
@@ -95,7 +95,7 @@ class MonitorTests(unittest.TestCase):
             self.mon.start()
             deadline=time.time()+2
             while probe.call_count<1 and time.time()<deadline:time.sleep(.02)
-            m.save_json(self.root/'accounts.json',{'version':1,'claude':'/bin/true','profiles':{'main':str(self.root/'main'),'second':str(self.root/'second')}})
+            m.save_json(self.root/'accounts.json',{'version':1,'claude':_support.PROGRAM,'profiles':{'main':str(self.root/'main'),'second':str(self.root/'second')}})
             self.mon.wake.set()
             deadline=time.time()+3
             while probe.call_count<2 and time.time()<deadline:time.sleep(.02)
@@ -253,7 +253,8 @@ class MonitorTests(unittest.TestCase):
     def test_card_validation_and_private_storage(self):
         with self.assertRaises(ValueError):self.mon.set_card({'profile':'main','status':'available','expires_at':float('nan')})
         self.mon.set_card({'profile':'main','status':'none'})
-        self.assertEqual((self.mon.state_dir/'reset-cards.json').stat().st_mode&0o077,0)
+        if not _support.WINDOWS:
+            self.assertEqual((self.mon.state_dir/'reset-cards.json').stat().st_mode&0o077,0)
 
     def test_http_origin_host_path_and_real_snapshot(self):
         server=m.HTTPServer(('127.0.0.1',0),m.Handler)
@@ -282,7 +283,7 @@ class AutomaticQuotaTests(unittest.TestCase):
         patch.start();self.addCleanup(patch.stop)
         self.temp=tempfile.TemporaryDirectory();self.addCleanup(self.temp.cleanup)
         self.root=Path(self.temp.name)
-        m.save_json(self.root/'accounts.json',{'version':1,'claude':'/bin/true','profiles':{'main':str(self.root/'main'),'spare':str(self.root/'spare')}})
+        m.save_json(self.root/'accounts.json',{'version':1,'claude':_support.PROGRAM,'profiles':{'main':str(self.root/'main'),'spare':str(self.root/'spare')}})
         self.mon=m.Monitor(self.root,Adapter(),self.root)
         now=time.time()
         self.mon.records={n:{'loggedIn':True,'email':n+'@example.test','windows':{

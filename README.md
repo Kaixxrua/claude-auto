@@ -2,7 +2,7 @@
 
 [![Tests](https://github.com/Kaixxrua/claude-auto/actions/workflows/test.yml/badge.svg)](https://github.com/Kaixxrua/claude-auto/actions/workflows/test.yml)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
-![Platform: Linux](https://img.shields.io/badge/platform-Linux-lightgrey.svg)
+![Platform: Linux | Windows](https://img.shields.io/badge/platform-Linux%20%7C%20Windows-lightgrey.svg)
 
 管理本机多个 Claude Code 订阅账号，在确认额度耗尽后保存上下文、切换可用账号，并恢复原会话。配套网页额度台展示 5 小时 / 7 天用量、重置时间和重置卡。
 
@@ -34,7 +34,7 @@
 
 ## 快速开始
 
-需要 **Linux、Python 3.10+、可用的时区数据库、已安装的官方 Claude Code，以及交互式终端**。核心代码仅依赖 Python 标准库；不需要 Node.js、Docker 或数据库。自动切换需要至少两个不同、已登录的 Claude 订阅账号。macOS、原生 Windows 和非交互 `--print` 模式目前不在支持范围；WSL 尚未单独验收。
+需要 **Linux 或 Windows 10 1809+ / 11、Python 3.10+、已安装的官方 Claude Code，以及交互式终端**（Linux 还需要可用的时区数据库）。核心代码仅依赖 Python 标准库；不需要 Node.js、Docker 或数据库。自动切换需要至少两个不同、已登录的 Claude 订阅账号。macOS 和非交互 `--print` 模式目前不在支持范围；WSL 尚未单独验收。Windows 的差异见下文[在 Windows 上使用](#在-windows-上使用)。
 
 先按[官方说明安装 Claude Code](https://code.claude.com/docs/en/setup)，然后：
 
@@ -63,6 +63,24 @@ claude-quota
 ```
 
 打开 **<http://127.0.0.1:8794>**。首次采集会逐个查询账号，之后跟随活动会话状态栏；闲置账号可点“刷新额度”查询。重置卡查询是单独操作。
+
+### 在 Windows 上使用
+
+需要官方**原生安装**的 `claude.exe`（[安装说明](https://code.claude.com/docs/en/setup)，默认在 `%USERPROFILE%\.local\bin`）；npm 安装的 `claude.cmd` 不受支持。在 PowerShell 或 Windows Terminal 中：
+
+```powershell
+git clone https://github.com/Kaixxrua/claude-auto.git
+cd claude-auto
+python scripts\install.py
+claude-accounts init
+claude-accounts setup 2
+claude-auto
+```
+
+- 安装器把各命令以 `.cmd` 文件放进 `%USERPROFILE%\.local\bin`（官方安装程序通常已把它加入 PATH），并固定使用运行安装器的那个 Python。
+- 账号间共享的设置文件需要符号链接：先打开 Windows「开发者模式」，或在管理员终端运行一次 `claude-accounts init` / `add`。共享文件夹在没有该权限时改用目录联接（junction）。
+- 启动器通过 ConPTY 代理终端。Windows 没有 SIGTERM，换号时启动器像人一样按两次 Ctrl+C 让原客户端正常退出（输入框里有草稿时再按两次），不会强制结束。
+- 官方客户端在 Windows 上按系统时区显示重置时间，额度台据此换算；额度查询同样在 ConPTY 中进行。`--systemd` 仅限 Linux，Windows 上需要时运行 `claude-quota`，或用任务计划程序在登录时启动。
 
 ## 常用命令
 
@@ -108,7 +126,7 @@ ssh -N -L 8794:127.0.0.1:8794 user@your-server
 
 ## 兼容性与边界
 
-- 启动器基于官方配置目录、[hooks](https://code.claude.com/docs/en/hooks) 和 `--resume`；初始版本在 Linux、Claude Code **2.1.295** 上做过运行验证。没有承诺所有旧版或未来版均兼容。
+- 启动器基于官方配置目录、[hooks](https://code.claude.com/docs/en/hooks) 和 `--resume`；初始版本在 Linux、Claude Code **2.1.295** 上做过运行验证，Windows 支持在 Windows 11、原生 Claude Code **2.1.309** 上验证过终端代理、换号续接、钩子与状态栏。没有承诺所有旧版或未来版均兼容。
 - 自动切换是交互终端功能。它保留恢复参数和权限限制，拒绝与上下文保护冲突的参数，例如 `--print`、`--no-session-persistence` 和 `--dangerously-skip-permissions`。
 - 重置卡使用**未公开、可能变化的 Anthropic OAuth 接口**，属于实验性功能。是否有卡、能否使用均由服务端决定；接口变化时可能无法查询或使用。
 - 启动器不读取 `.credentials.json`。额度台的重置卡模块会按需读取现有 OAuth access token，在内存中向固定的 Anthropic 域名发送请求；不会返回给网页、导出或自行刷新令牌。
@@ -124,7 +142,7 @@ python3 scripts/check_release.py
 node --check dashboard/static/app.js
 ```
 
-测试使用临时账号目录、伪 CLI、真实 PTY 和本地 HTTP 服务，不需要真实账号，不请求 Anthropic，不使用真实重置卡。CI 在 Linux 的 Python 3.10、3.12、3.13 上运行。更多信息见 [CONTRIBUTING.md](CONTRIBUTING.md)。
+测试使用临时账号目录、伪 CLI、真实 PTY（Windows 上为 ConPTY）和本地 HTTP 服务，不需要真实账号，不请求 Anthropic，不使用真实重置卡。CI 在 Linux 的 Python 3.10、3.12、3.13 和 Windows 的 Python 3.10、3.13 上运行。更多信息见 [CONTRIBUTING.md](CONTRIBUTING.md)。
 
 ## 许可证
 

@@ -4,15 +4,15 @@ import http.client
 import json
 import os
 from pathlib import Path
-import select
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from unittest import mock
 
-from _support import REPO_ROOT
+from _support import REPO_ROOT, WINDOWS, native_fixture
 import monitor
 
 
@@ -47,16 +47,18 @@ class InstallationTests(unittest.TestCase):
                     'ANTHROPIC_PROFILE', 'CLAUDE_CODE_USE_BEDROCK', 'CLAUDE_CODE_USE_VERTEX',
                     'CLAUDE_CODE_USE_FOUNDRY', 'CLAUDE_CONFIG_DIR'):
             self.env.pop(key, None)
-        self.env.update(HOME=str(self.home), CLAUDE_ACCOUNTS_HOME=str(self.runtime),
+        self.env.update(HOME=str(self.home), USERPROFILE=str(self.home), CLAUDE_ACCOUNTS_HOME=str(self.runtime),
                         PYTHONUNBUFFERED='1')
-        self.native = self.home/'.local/bin/claude'
-        self.native.parent.mkdir(parents=True)
-        self.native.write_text(FAKE_NATIVE)
-        self.native.chmod(0o755)
+        (self.home/'.local/bin').mkdir(parents=True)
+        self.native = native_fixture(self.home/'.local/bin/claude', FAKE_NATIVE)
+
+    def bin(self, name):
+        # Windows runs the installed commands through their .cmd files.
+        return self.prefix/'bin'/(name+'.cmd' if WINDOWS else name)
 
     def command(self, *args, check=True, env=None):
-        result = subprocess.run([str(arg) for arg in args], env=env or self.env,
-                                cwd=self.root, capture_output=True, text=True, timeout=20)
+        result = subprocess.run([str(arg) for arg in args], env=env or self.env, cwd=self.root,
+                                capture_output=True, encoding='utf-8', errors='replace', timeout=20)
         if check:
             self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
         return result
@@ -68,17 +70,19 @@ class InstallationTests(unittest.TestCase):
         self.install()
         self.assertFalse(self.runtime.exists(), 'install must not initialize accounts')
         plugin = self.prefix/'share/claude-auto/compaction-recovery'
-        self.assertEqual(json.loads((plugin/'.claude-plugin/plugin.json').read_text())['name'],
+        self.assertEqual(json.loads((plugin/'.claude-plugin/plugin.json').read_text(encoding='utf-8'))['name'],
                          'auto-compaction-recovery')
         self.assertTrue((plugin/'hooks/register.js').is_file())
         for command in ('claude-auto', 'claude-accounts', 'claude-quota', 'claude-delegate'):
-            self.command(self.prefix/'bin'/command, '--help')
-        self.command(self.prefix/'bin/claude-accounts', 'init')
-        registry = json.loads((self.runtime/'accounts.json').read_text())
+            self.command(self.bin(command), '--help')
+        self.command(self.bin('claude-accounts'), 'init')
+        registry = json.loads((self.runtime/'accounts.json').read_text(encoding='utf-8'))
         self.assertEqual(registry['profiles']['main'], str(self.home/'.claude'))
         self.assertEqual(registry['profiles']['second'], str(self.runtime/'second'))
-        self.assertEqual((self.runtime/'accounts.json').stat().st_mode & 0o777, 0o600)
-        self.assertTrue((self.runtime/'second/projects').is_symlink())
+        if not WINDOWS:
+            self.assertEqual((self.runtime/'accounts.json').stat().st_mode & 0o777, 0o600)
+        projects = self.runtime/'second/projects'
+        self.assertTrue(projects.is_symlink() or getattr(os.path, 'isjunction', lambda _: False)(projects))
         sentinel = self.runtime/'second/.credentials.json'
         sentinel.write_text('{"fixture": "do not overwrite"}')
         before = (sentinel.read_bytes(), (self.runtime/'accounts.json').read_bytes(), self.native.read_bytes())
@@ -86,6 +90,10 @@ class InstallationTests(unittest.TestCase):
         self.assertEqual(before, (sentinel.read_bytes(), (self.runtime/'accounts.json').read_bytes(), self.native.read_bytes()))
         self.assertNotIn('.credentials.json', [p.name for p in self.prefix.rglob('*')])
         delegate = self.prefix/'share/claude-auto/account-delegation'
+        if WINDOWS:
+            # Windows has no python3 command; the plugin runs with the installing interpreter.
+            server = json.loads((delegate/'.mcp.json').read_bytes())['mcpServers']['accounts']
+            self.assertEqual(server['command'], sys.executable)
         self.assertTrue((delegate/'.mcp.json').is_file())
         rpc = json.dumps({'jsonrpc': '2.0', 'id': 1, 'method': 'tools/list'})+'\n'
         result = subprocess.run([sys.executable, str(delegate/'scripts/server.py')],
@@ -99,33 +107,44 @@ class InstallationTests(unittest.TestCase):
         (bindir/'claude-accounts').write_text('old launcher')
         victim = self.root/'keep.txt'
         victim.write_text('keep')
-        (bindir/'claude-auto').symlink_to(victim)
+        self.bin('claude-auto').symlink_to(victim)
         result = self.command(sys.executable, REPO_ROOT/'scripts/install.py', '--prefix', self.prefix, check=False)
         self.assertNotEqual(result.returncode, 0)
-        self.assertEqual(victim.read_text(), 'keep')
-        self.assertEqual((bindir/'claude-accounts').read_text(), 'old launcher')
+        self.assertEqual(victim.read_text(encoding='utf-8'), 'keep')
+        self.assertEqual((bindir/'claude-accounts').read_text(encoding='utf-8'), 'old launcher')
 
+    @unittest.skipIf(WINDOWS, 'systemd user service')
     def test_systemd_install_only_writes_unit_under_isolated_home(self):
         self.command(sys.executable, REPO_ROOT/'scripts/install.py', '--systemd')
         service = self.home/'.config/systemd/user/claude-quota-monitor.service'
-        self.assertIn('--bind 127.0.0.1', service.read_text())
+        self.assertIn('--bind 127.0.0.1', service.read_text(encoding='utf-8'))
         self.assertFalse((service.parent/'default.target.wants').exists())
         self.assertFalse(self.runtime.exists())
 
     def test_installed_server_collects_fixture_usage_and_serves_all_assets(self):
         self.install()
-        self.command(self.prefix/'bin/claude-accounts', 'init')
+        self.command(self.bin('claude-accounts'), 'init')
         # Explicit --root must also configure the dynamically loaded launcher.
         bait = self.root/'other accounts'
         bait.mkdir()
         (bait/'accounts.json').write_text(json.dumps({'disabled': {'main': 'wrong root', 'second': 'wrong root'}}))
         env = dict(self.env, CLAUDE_ACCOUNTS_HOME=str(bait))
-        process = subprocess.Popen([str(self.prefix/'bin/claude-quota'), '--root', str(self.runtime),
-                                    '--port', '0', '--cwd', str(self.root)], env=env,
-                                   cwd=self.root, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        command = [str(self.prefix/'bin/claude-quota'), '--root', str(self.runtime), '--port', '0', '--cwd', str(self.root)]
+        options = {}
+        if WINDOWS:
+            # Run the dashboard itself, in its own group, so Ctrl+Break can stop it like a terminal would.
+            command[:1] = [sys.executable, str(self.prefix/'share/claude-quota-monitor/monitor.py'),
+                           '--adapter', str(self.prefix/'bin/claude-accounts')]
+            options = {'creationflags': subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW}
+        process = subprocess.Popen(command, env=env, cwd=self.root, stdout=subprocess.PIPE,
+                                   stderr=subprocess.PIPE, text=True, encoding='utf-8', **options)
         try:
-            self.assertTrue(select.select([process.stdout], [], [], 10)[0], 'server did not start')
-            line = process.stdout.readline().strip()
+            started = []
+            reader = threading.Thread(target=lambda: started.append(process.stdout.readline()), daemon=True)
+            reader.start()
+            reader.join(10)
+            self.assertTrue(started, 'server did not start')
+            line = started[0].strip()
             self.assertIn('http://127.0.0.1:', line)
             port = int(line.rsplit(':', 1)[1])
 
@@ -162,7 +181,12 @@ class InstallationTests(unittest.TestCase):
             self.assertEqual(request('/.credentials.json')[0], 404)
         finally:
             if process.poll() is None:
-                process.terminate()
+                if WINDOWS:
+                    sys.path.insert(0, str(REPO_ROOT/'lib'))
+                    import claude_auto_os
+                    claude_auto_os.stop_group(process.pid)
+                else:
+                    process.terminate()
             stdout, stderr = process.communicate(timeout=15)
             self.assertEqual(process.returncode, 0, stdout+stderr)
 
