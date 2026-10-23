@@ -1458,8 +1458,25 @@ def sync_monitored_recoveries(state_dir):
                                   record.get("usage_query_started_at", 0))
 
 
+def delegated_accounts(state_dir):
+    """Accounts running a cross-account delegated job (claude-delegate) right now."""
+    busy = set()
+    for path in (state_dir / "delegation" / "jobs").glob("*/job.json"):
+        try:
+            job = read_json(path, {})
+            pid = job.get("native_pid")
+            if (job.get("status") == "running" and isinstance(job.get("account"), str) and
+                    isinstance(pid, int) and process_identity(pid) == job.get("native_start")):
+                busy.add(job["account"])
+        except (OSError, ValueError, AttributeError):
+            continue
+    return busy
+
+
 def selection_candidates(registry, names, current, attempted, quotas, after=False):
     now = time.time()
+    # An account doing a delegated job comes last, so the two do not drain one quota.
+    delegated = delegated_accounts(ROOT / "state")
     candidates = [name for name in account_ring(names, current, after=after)
                   if name not in attempted and not disabled_reason(registry, name)
                   and quotas.get(name, {}).get("blocked_until", 0) <= now]
@@ -1469,7 +1486,7 @@ def selection_candidates(registry, names, current, attempted, quotas, after=Fals
         record = quotas.get(name, {})
         return (record.get("source") == "official_usage_recovery" and
                 now - 300 <= record.get("available_at", 0) <= now + 1)
-    return sorted(candidates, key=lambda name: not recovered(name))
+    return sorted(candidates, key=lambda name: (name in delegated, not recovered(name)))
 
 
 def overlay_settings(run_dir, account, registry):

@@ -90,6 +90,16 @@ class RecoveryTests(unittest.TestCase):
             candidates=a.selection_candidates(self.registry,names,current,{current},q,after=True)
             self.assertEqual(candidates[0],'second');self.assertNotIn('main',candidates)
 
+    def test_account_running_a_delegated_job_comes_last(self):
+        names=['main','second','account06','account07','account09']
+        job={'status':'running','account':'account07','native_pid':os.getpid(),'native_start':a.process_identity(os.getpid())}
+        a.write_json(self.state/'delegation/jobs'/('d'*32)/'job.json',job)
+        c=a.selection_candidates(self.registry,names,'account06',{'account06'},a.read_quota_state(self.state),after=True)
+        self.assertEqual(c,['account09','account07'])
+        job['native_start']='0';a.write_json(self.state/'delegation/jobs'/('d'*32)/'job.json',job)
+        c=a.selection_candidates(self.registry,names,'account06',{'account06'},a.read_quota_state(self.state),after=True)
+        self.assertEqual(c,['account07','account09'])
+
     def test_recovery_priority_expires_but_does_not_reblock(self):
         self.recover();q=a.read_quota_state(self.state);q['second']['available_at']-=301
         names=['main','second','account06','account07','account09']
