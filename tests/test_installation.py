@@ -1,6 +1,7 @@
 """Exercise a clean install and the real HTTP server without account access."""
 import argparse
 import http.client
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -65,6 +66,22 @@ class InstallationTests(unittest.TestCase):
 
     def install(self):
         self.command(sys.executable, REPO_ROOT/'scripts/install.py', '--prefix', self.prefix)
+
+    @unittest.skipUnless(WINDOWS, 'cmd.exe shims')
+    def test_shims_reach_python_in_a_non_ascii_user_folder_through_their_own_folder(self):
+        spec = importlib.util.spec_from_file_location('claude_auto_install', REPO_ROOT/'scripts/install.py')
+        installer = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(installer)
+        user = self.root/'用户'
+        other_drive = Path('Y:/' if str(self.root)[:1].upper() == 'Z' else 'Z:/')
+        with mock.patch.object(installer.sys, 'executable', str(user/'Python'/'python.exe')), \
+                mock.patch.object(installer.oslayer, 'short_path', side_effect=str):
+            shims = installer.windows_shims(user/'.local'/'bin')
+            with self.assertRaises(ValueError):
+                installer.windows_shims(other_drive/'bin')
+        self.assertTrue(all(text.isascii() for text in shims.values()))
+        self.assertEqual(shims['claude-accounts.cmd'],
+                         '@echo off\r\n"%~dp0..\\..\\Python\\python.exe" "%~dp0claude-accounts" %*\r\n')
 
     def test_install_init_upgrade_preserves_private_data_and_native_binary(self):
         self.install()

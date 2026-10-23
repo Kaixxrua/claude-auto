@@ -39,14 +39,22 @@ def atomic_install(content: bytes, target: Path, mode: int):
             os.unlink(temporary)
 
 
-def windows_shims():
-    """cmd.exe entry points beside the scripts. cmd.exe reads a batch file in the console code
-    page, so the interpreter path is kept ASCII; %~dp0 is expanded as Unicode at run time."""
+def windows_shims(folder: Path):
+    """cmd.exe entry points in folder, beside the scripts. cmd.exe reads a batch file in the
+    console code page, so the file stays ASCII; %~dp0 is expanded as Unicode at run time. A
+    Python under a non-ASCII user folder without 8.3 names is reached relative to %~dp0."""
     python = sys.executable
     if not python.isascii():
         python = oslayer.short_path(python)
+    if python.isascii():
+        python = python.replace('%', '%%')
+    else:
+        try:
+            python = '%~dp0' + os.path.relpath(sys.executable, folder).replace('%', '%%')
+        except ValueError:  # another drive
+            pass
     if not python.isascii():
-        raise ValueError(f'the Python path needs an ASCII form (an 8.3 short name): {sys.executable}')
+        raise ValueError(f'the Python path needs an ASCII form (an 8.3 short name, or a path relative to {folder}): {sys.executable}')
     run = f'@echo off\r\n"{python}" '
     return {
         'claude-accounts.cmd': run+'"%~dp0claude-accounts" %*\r\n',
@@ -92,7 +100,7 @@ def install(prefix: Path, systemd: bool = False):
             content = (json.dumps(config, indent=2)+'\n').encode()
         pending.append((content, target, mode))
     if oslayer.WINDOWS:
-        for name, text in windows_shims().items():
+        for name, text in windows_shims(prefix/'bin').items():
             target = prefix/'bin'/name
             if target.is_symlink() or (target.exists() and not target.is_file()):
                 raise ValueError(f'refusing non-regular installation target: {target}')
