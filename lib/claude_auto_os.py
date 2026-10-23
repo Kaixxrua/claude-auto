@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import codecs
 import contextlib
+import datetime
 import errno
 import os
 from pathlib import Path
@@ -26,6 +27,7 @@ import sys
 import tempfile
 import threading
 import time
+import zoneinfo
 
 WINDOWS = os.name == 'nt'
 # os.open() is a text-mode CRT call on Windows unless O_BINARY is given.
@@ -67,6 +69,19 @@ def sync_directory(path):
         os.fsync(fd)
     finally:
         os.close(fd)
+
+
+def time_zone(name):
+    """The zone Claude Code names in /usage and limit messages: UTC (what TZ asks for on
+    Linux), an IANA zone, or None for local time. Claude Code on Windows ignores TZ and names
+    the system zone, which Python there may lack without the tzdata package; local time is
+    that zone. False for a name that is no zone."""
+    if name.upper() in ('UTC', 'GMT'):
+        return datetime.timezone.utc
+    try:
+        return zoneinfo.ZoneInfo(name)
+    except (zoneinfo.ZoneInfoNotFoundError, ValueError, OSError):
+        return None if re.fullmatch(r'[A-Za-z]+(?:/[\w+-]+)+', name) else False
 
 
 def path_stamp(path):

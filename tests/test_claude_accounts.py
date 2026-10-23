@@ -243,6 +243,15 @@ class AccountsTests(unittest.TestCase):
             self.assertEqual(m.quota_reset_from_error(event, {'at':now,'limits':{'seven_day':{'used_percentage':13}}}), expected)
             self.assertEqual(m.quota_reset_from_error({**event,'message':"You've hit your session limit · resets 9:40pm (unknown-zone)"}, {}),0)
 
+    def test_system_zone_without_tz_database_is_local_time(self):
+        # Claude Code on Windows names the system zone; Python there may lack tzdata.
+        now = m.datetime.datetime(2026,10,7,17,15).timestamp()
+        event = {'error':'rate_limit','message':"You've hit your session limit · resets 9:40pm (Asia/Singapore)"}
+        missing = m.oslayer.zoneinfo.ZoneInfoNotFoundError('No time zone found with key Asia/Singapore')
+        with mock.patch.object(m.time,'time',return_value=now), \
+                mock.patch.object(m.oslayer.zoneinfo,'ZoneInfo',side_effect=missing):
+            self.assertEqual(m.quota_reset_from_error(event,{}),m.datetime.datetime(2026,10,7,21,40).timestamp())
+
     def test_reset_time_crosses_midnight(self):
         now = m.datetime.datetime(2026,10,7,23,15,tzinfo=m.datetime.timezone.utc).timestamp()
         with mock.patch.object(m.time,'time',return_value=now):

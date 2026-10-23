@@ -23,7 +23,6 @@ import threading
 import time
 from urllib.parse import urlsplit
 import uuid
-import zoneinfo
 
 HERE = Path(__file__).resolve().parent
 # The OS layer: installed in share/claude-auto/lib, or lib/ in a source checkout.
@@ -283,18 +282,6 @@ def official_usage(registry, name, client_factory=OfficialClient):
     return identity['email'], oauth_windows(payload, time.time())
 
 
-def reset_zone(name):
-    """The zone /usage names: (UTC) as requested on Linux. Claude Code on Windows ignores TZ and
-    shows the system zone, which Python there may lack without tzdata; local time is that zone.
-    None means local time; False an unrecognized name."""
-    if name.upper() == 'UTC':
-        return UTC
-    try:
-        return zoneinfo.ZoneInfo(name)
-    except (zoneinfo.ZoneInfoNotFoundError, ValueError, OSError):
-        return None if re.fullmatch(r'[A-Za-z]+(?:/[\w+-]+)+', name) else False
-
-
 def parse_reset(text, now, window):
     """Native /usage renders minute precision in the named zone."""
     match = re.fullmatch(
@@ -306,7 +293,7 @@ def parse_reset(text, now, window):
     hour, minute = int(hour), int(minute or 0)
     if not 1 <= hour <= 12 or not 0 <= minute < 60:
         return None
-    zone = reset_zone(zone)
+    zone = oslayer.time_zone(zone)
     if zone is False:
         return None
     hour = hour % 12 + (12 if half.lower() == 'pm' else 0)
