@@ -1,5 +1,7 @@
 # Claude Auto
 
+The optional [account delegation plugin](docs/delegation.md) runs explicitly delegated tasks in independent Claude sessions on accounts with verified remaining quota. It supports results, cancellation and resumption without replacing the native `Agent` tool. Read-only by default; project mode preserves existing permission rules and denies unattended approval prompts.
+
 [中文](README.md) · [Configuration](docs/configuration.md) · [Security](SECURITY.md)
 
 A local account launcher and quota dashboard for Claude Code. After a confirmed subscription quota error, the launcher verifies a context checkpoint, switches to another eligible account, and resumes the original session ID. The dashboard shows five-hour / weekly usage, reset times, and limit-reset grants.

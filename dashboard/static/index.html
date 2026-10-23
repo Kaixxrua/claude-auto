@@ -15,6 +15,7 @@
     <div class="sidebar-label">工作空间</div>
     <a class="nav-item selected" href="#overview"><span class="nav-icon">▤</span>账号总览<span class="nav-count" id="nav-count">—</span></a>
     <a class="nav-item" href="#resets"><span class="nav-icon">◷</span>重置时间</a>
+    <a class="nav-item" href="#delegations"><span class="nav-icon">⇆</span>委派任务<span class="nav-count" id="nav-delegations">—</span></a>
     <button class="nav-item" id="help-open"><span class="nav-icon">ⓘ</span>数据说明</button>
     <div class="sidebar-bottom"><span class="server-dot"></span>本地额度台<small><span id="server-address">—</span><em>数据保存在此服务器</em></small></div>
   </aside>
@@ -32,12 +33,13 @@
       <div class="summary card-summary"><span>可使用的重置次数 <b>官方查询</b></span><strong id="summary-cards">—</strong><small id="summary-cards-note">点击“查询重置卡”核对</small></div>
     </section>
     <div class="mode-note" role="status"><span class="mode-icon">◷</span><div><b id="availability-title">正在核验可用账号</b><span id="availability-detail">额度未知不等于额度耗尽。</span></div></div>
-    <div class="mode-note"><span class="mode-icon">⇄</span><div><b>先统一查询，随后跟随状态栏</b><span id="sync-note">网页每 5 秒读取最新记录；闲置账号不反复查询。</span></div><span id="local-clock" class="local-clock"></span></div>
+    <div class="mode-note"><span class="mode-icon">⇄</span><div><b>自动查询，实时跟随</b><span id="sync-note">网页每 5 秒读取最新记录；闲置账号不反复查询。</span></div><span id="local-clock" class="local-clock"></span></div>
     <section class="account-section" aria-label="账号额度">
       <div class="section-toolbar"><div class="section-title"><h2>账号额度</h2><span id="visible-count"></span></div><div class="filters"><label class="search-wrap"><span>⌕</span><input id="search" type="search" placeholder="搜索账号或邮箱" aria-label="搜索账号或邮箱"></label><select id="filter" aria-label="筛选账号"><option value="all">全部账号</option><option value="live">状态栏跟随</option><option value="limited">额度达上限</option><option value="cards">有重置卡</option><option value="logged_out">未登录</option></select></div></div>
       <div class="account-grid" id="accounts"><div class="loading-card">正在连接服务器，读取账号额度…</div></div>
       <div class="empty-state" id="empty" hidden>没有符合条件的账号。<button id="clear-filters">清除筛选</button></div>
     </section>
+    <section id="delegations" class="reset-section"><div class="section-toolbar"><div class="section-title"><h2>委派任务</h2><span id="delegation-count"></span></div><span class="timezone" id="delegation-policy">跨账号委派的独立会话 · 最近 24 小时</span></div><div id="delegation-list" class="reset-list"><div class="loading-card">等待任务数据</div></div></section>
     <section id="resets" class="reset-section"><div class="section-toolbar"><div class="section-title"><h2>接下来重置</h2><span>按最近记录</span></div><span id="timezone" class="timezone"></span></div><div id="reset-list" class="reset-list"><div class="loading-card">等待额度数据</div></div></section>
     <footer><span><i class="server-dot"></i>仅本地账号 · 官方 Claude 数据</span><span>重置卡仅在确认后使用</span></footer>
   </main>
@@ -68,12 +70,14 @@
     </form>
   </dialog>
   <dialog id="help-dialog"><div class="dialog-heading"><div><div class="eyebrow">ABOUT THE DATA</div><h2>这些数据从哪里来</h2></div><button class="icon-button" data-close aria-label="关闭">×</button></div><div class="help-content">
-    <h3>额度与重置时间</h3><p>监控首次启动时，通过官方 Claude Code 的 /usage 查询全部账号一次。之后只读取 claude-auto 状态栏输出的 5h、7d 字段，不定时查询闲置账号，重启服务也会保留已有记录。新增加的账号位置会查询一次；“刷新全部”或账号右上角的刷新按钮可再次查询。</p>
-    <p>状态栏数据通常在模型响应后更新；没有活动时保留上次记录。网页每 5 秒读取本地记录。额度百分比并不是固定的 token 数。/usage 的百分比、重置时间使用官方界面的显示精度，时间约到分钟；状态栏时间可精确到秒。</p>
+    <h3>额度与重置时间</h3><p>监控首次启动时，通过官方 Claude Code 的 /usage 查询全部账号一次。之后用官方额度接口自动查询：有活动会话或委派任务的账号每分钟一次，闲置账号每 4 分钟一次，某个窗口到了重置时间会马上再查。这个接口只读额度，不发模型请求。登录凭据过期时，改请官方客户端用 /usage 查一次，客户端会顺带刷新登录。“刷新全部”或账号右上角的刷新按钮可随时再查。</p>
+    <p>状态栏和委派会话的数据在每次模型响应后更新；没有活动时保留上次记录。网页每 5 秒读取本地记录。额度百分比并不是固定的 token 数。/usage 的百分比、重置时间使用官方界面的显示精度，时间约到分钟；状态栏时间可精确到秒。</p>
     <h3>为什么显示“待确认”</h3><p>重置时间到了，但还没有收到新额度时，不会猜测已恢复为 100%。其他设备或 Claude 网页上的使用也可能使旧记录滞后，需要时可手动刷新。</p>
     <p>一次查询只返回部分额度时，保留未返回窗口的最近记录并显示提示。会话收到的官方限额错误也会显示到预计恢复时间；当前有窗口运行不代表账号仍有额度。首页分别统计可用、达上限和待确认的账号。</p>
     <h3>重置卡</h3><p>“查询重置卡”使用当前账号的官方登录查询卡片余额、适用范围和到期时间，同时更新返回的额度数据。页面标明查询时间，超过 5 分钟需重新查询；登录失效或接口异常表示“待确认”，不等于没有卡。停用账号会跳过。</p>
     <p>“使用重置卡”先刷新卡片信息，并显示要使用的账号与邮箱。只有点击“确认消耗 1 次”才提交。提交结果不明确时不会重复使用；请先查询状态。手动备注仅供参考，不能作为使用依据。刷新网页不会自动使用或反复查询卡片。</p>
+    <h3>套餐到期</h3><p>官方账号资料只给订阅的开通时间和付款方式（如苹果内购），不给到期时间。额度台按开通日推算：月付每月同一天、同一时刻续期，年付每年一次；账号过了续期日仍是付费套餐，说明已经续费，所以显示的是当前这一期的结束时间。官方额度接口会注明月付还是年付，没注明时按月付算。关掉自动续费的账号会在这个时间降为免费版；续费成功则自动顺延。3 天内到期标橙，1 天内标红。</p><p>启用的账号随每次官方额度查询更新套餐资料。停用账号不再查询官方，显示 Claude Code 客户端最近一次保存的账号资料，并注明记录日期。</p>
+    <h3>委派任务</h3><p>列出跨账号委派工具（claude-delegate）最近 24 小时的任务：标题、所在账号、状态，以及这个账号还剩多少额度。“运行中”表示它的 claude 进程还在；“最近动作”是它的会话记录最后一次写入的时间。跑渲染这类长命令时，可能一阵子没有新动作，超过 20 分钟没有新动作会标黄。这里不显示任务内容和报告。</p><p>右上角列出委派规则（~/.claude-accounts/state/delegation/policy.json）打开了哪些：账号不够时几个任务共用一个账号；没有可用账号时排队，等到账号重置再派；额度用完、账号出错或服务端出错时，在原会话里换账号接着做；回复不是指定模型生成的就立刻停下，换账号接着做，并要求先撤销那一轮的改动。“续做守护”是常驻服务 claude-delegate-supervisor，负责接手工作进程已经退出的任务，比如重启之后。</p>
     <a href="https://support.claude.com/en/articles/17007452-what-is-a-limit-reset" target="_blank" rel="noopener noreferrer">阅读官方重置卡说明 ↗</a>
   </div></dialog>
   <div id="toast" class="toast" role="status" hidden></div>

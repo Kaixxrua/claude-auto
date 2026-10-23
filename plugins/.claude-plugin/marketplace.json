@@ -6,5 +6,9 @@
     "name": "auto-compaction-recovery",
     "source": "./compaction-recovery",
     "description": "Observe native compaction without changing its scheduling or retries."
+  }, {
+    "name": "account-delegation",
+    "source": "./account-delegation",
+    "description": "Optional cross-account delegation with isolated sessions and verified quota."
   }]
 }

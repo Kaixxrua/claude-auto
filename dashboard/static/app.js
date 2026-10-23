@@ -5,6 +5,7 @@ const escapeHTML = value => String(value ?? '').replace(/[&<>"']/g, x => ({'&':'
 const zone = Intl.DateTimeFormat().resolvedOptions().timeZone;
 const stamp = new Intl.DateTimeFormat('zh-CN', {month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',hour12:false});
 const clock = new Intl.DateTimeFormat('zh-CN', {hour:'2-digit',minute:'2-digit',second:'2-digit',hour12:false});
+const day = new Intl.DateTimeFormat('zh-CN', {month:'2-digit',day:'2-digit'});
 let data = null, fetching = false, offline = false, offset = 0, privacy = true, toastTimer;
 try { privacy = localStorage.getItem('claude-monitor-show-email') !== 'yes'; } catch (_) {}
 const now = () => Date.now()/1000 + offset;
@@ -19,7 +20,8 @@ function maskEmail(value) {
 function age(value) {
   if (!value) return '尚未查询';
   const delta = Math.max(0,now()-value);
-  if (delta<60) return '刚刚';
+  if (delta<10) return '刚刚';
+  if (delta<60) return `${Math.floor(delta)} 秒前`;
   if (delta<3600) return `${Math.floor(delta/60)} 分钟前`;
   if (delta<86400) return `${Math.floor(delta/3600)} 小时前`;
   return `${Math.floor(delta/86400)} 天前`;
@@ -51,6 +53,29 @@ function cardLabel(card) {
   if(card.source==='official_oauth_api' && card.status==='available') return `剩余 ${card.resets_left} 次 · 可用 ${card.usable_count} 次`;
   return cardLabels[card.status]||'待查询';
 }
+const planNames = {claude_pro:'Pro',claude_max:'Max',claude_team:'Team',claude_enterprise:'Enterprise'};
+const billingNames = {apple_subscription:'苹果内购',google_play_subscription:'Google Play',stripe_subscription:'网页订阅'};
+const periodNames = {monthly:'月付',annual:'年付'};
+const named = (map,key) => key && Object.hasOwn(map,key) ? map[key] : null;
+function remaining(value) {
+  const s=Math.max(0,value-now());
+  return s>=86400?`剩 ${Math.floor(s/86400)} 天`:s>=3600?`剩 ${Math.floor(s/3600)} 小时`:`剩 ${Math.max(1,Math.ceil(s/60))} 分钟`;
+}
+function planHTML(a) {
+  const p=a.plan;
+  const row=(value,tone,detail)=>`<div class="reset-card-row plan-row"><span class="ticket-icon plan-icon">◔</span><span>套餐到期</span><span class="card-state plan-state ${tone}">${value}</span></div><div class="card-detail plan-detail">${escapeHTML(detail)}</div>`;
+  if(!p) return row('尚未取得','',a.loggedIn?'等待官方查询账号资料':'登录后显示');
+  // The official profile gives the start only; the server infers the end of the current period.
+  const details=[named(planNames,p.type)||(p.type?'未订阅付费套餐':'套餐类型未知')];
+  if(p.billing) details.push((named(billingNames,p.billing)||p.billing)+(named(periodNames,p.period)||''));
+  if(p.started_at) details.push(`${day.format(new Date(p.started_at*1000))} 开通`);
+  if(p.ends_at) details.push(p.renewals?`已续 ${p.renewals} 期`:'首期',p.period?'按开通日推算':'按月付推算');
+  if(p.status) details.push(`官方状态 ${p.status}`);
+  if(p.source==='client_profile') details.push(p.checked_at?`客户端 ${day.format(new Date(p.checked_at*1000))} 记录`:'客户端记录');
+  if(!p.ends_at) return row(named(planNames,p.type)?'到期时间未知':'—','',details.join(' · '));
+  const rest=p.ends_at-now();
+  return row(`${date(p.ends_at)} 到期 · <span data-plan-end="${p.ends_at}">${remaining(p.ends_at)}</span>`,rest<=86400?'urgent':rest<=3*86400?'soon':'',details.join(' · '));
+}
 function quotaHTML(window, key) {
   const label=key==='five_hour'?'5 小时':'7 天';
   const abbreviation=key==='five_hour'?'SESSION':'WEEKLY';
@@ -62,12 +87,12 @@ function quotaHTML(window, key) {
   return `<div class="quota-window"><div class="quota-heading"><span class="quota-title">${label}<span>${abbreviation}</span></span>${value}</div>
     <div class="bar-track ${!window||expired?'unknown':''}" role="meter" aria-label="${label}已用额度" ${window&&!expired?`aria-valuenow="${used}" aria-valuemin="0" aria-valuemax="100"`:''}>${window&&!expired?`<div class="bar-fill ${tone}" style="width:${used}%"></div>`:''}</div>
     <div class="quota-meta"><span>${window?`上次已用 ${pct(used)}%`:'尚无额度记录'}</span><span ${reset?`data-reset="${reset}"`:''} class="reset-count ${expired?'waiting':''}">${reset?`${expired?'': '重置倒计时 '}${countdown(reset)}`:'未提供重置时间'}</span></div>
-    <div class="quota-meta"><span>${window?.source==='session_statusline'?'状态栏':window?.source==='official_oauth_api'?'官方接口':'官方 /usage'}</span><span>${reset?`${window.reset_precision==='minute'?'约 ':''}${date(reset)} 重置`:(window?.reset_display?escapeHTML(window.reset_display):'—')}</span></div></div>`;
+    <div class="quota-meta"><span>${window?.source==='session_statusline'?'状态栏':window?.source==='delegated_session'?'委派会话':window?.source==='official_oauth_api'?'官方接口':'官方 /usage'}</span><span>${reset?`${window.reset_precision==='minute'?'约 ':''}${date(reset)} 重置`:(window?.reset_display?escapeHTML(window.reset_display):'—')}</span></div></div>`;
 }
 function accountHTML(a,index) {
   const card=a.reset_card||{status:'unknown'};
-  const state=a.state==='disabled'?stateLabels.disabled:a.refreshing?'查询中':a.state==='limited'?stateLabels.limited:a.live?'状态栏跟随':stateLabels[a.state];
-  const badge=['disabled','limited'].includes(a.state)?a.state:a.live?'live':a.state;
+  const state=a.state==='disabled'?stateLabels.disabled:a.refreshing?'查询中':a.state==='limited'?stateLabels.limited:a.live?'状态栏跟随':a.delegated?'委派任务中':stateLabels[a.state];
+  const badge=['disabled','limited'].includes(a.state)?a.state:(a.live||a.delegated)?'live':a.state;
   const cardDetails=[];
   if (card.source==='official_oauth_api') {
     cardDetails.push(card.error || card.reason_text || (card.checked_at?`${age(card.checked_at)}查询官方余额`:'尚未完成查询'));
@@ -81,10 +106,10 @@ function accountHTML(a,index) {
   const content = a.state==='disabled' ? `<div class="quota-empty"><span>○</span><div>已停用，自动切换会跳过此账号</div><div>${escapeHTML(a.disabled_reason)}</div></div>` : a.loggedIn ? quotaHTML(a.windows?.five_hour,'five_hour')+quotaHTML(a.windows?.seven_day,'seven_day') : `<div class="quota-empty"><span>○</span><div>${a.state==='pending'?'等待首次登录检查':'此账号位置尚未登录'}</div><code class="login-command">claude-accounts login ${escapeHTML(a.profile)}</code></div>`;
   return `<article class="account-card ${a.state==='limited'?'is-limited':''} ${a.loggedIn===false?'is-offline':''}" data-profile="${escapeHTML(a.profile)}">
     <div class="account-header"><span class="account-avatar">${String(index+1).padStart(2,'0')}</span><div class="account-identity"><div class="account-name"><h3>${escapeHTML(a.profile)}</h3>${a.subscriptionType?`<span class="plan-pill">${escapeHTML(a.subscriptionType)}</span>`:''}</div><span class="email">${escapeHTML(maskEmail(a.email))}</span></div><div class="account-actions"><span class="status-badge ${badge}"><i></i>${escapeHTML(state)}</span><button class="icon-button ${a.refreshing?'spinning':''}" data-action="refresh" data-profile="${escapeHTML(a.profile)}" aria-label="刷新 ${escapeHTML(a.profile)}" title="查询一次此账号的官方额度" ${a.refreshing||a.state==='disabled'?'disabled':''}>↻</button></div></div>
-    ${content}${a.state!=='disabled'&&a.quota_limit?.active?`<div class="account-error">官方客户端已报告限额，约 ${date(a.quota_limit.blocked_until)} 后可重试。额度查询不完整时仍保留此提示。</div>`:''}${a.error&&a.loggedIn&&a.state!=='disabled'?`<div class="account-error">${escapeHTML(a.error)}</div>`:''}
-    <div class="card-divider"></div><div class="reset-card-row"><span class="ticket-icon">✧</span><span>重置卡</span><span class="card-state ${card.status}">${escapeHTML(cardLabel(card))}</span></div><div class="card-detail">${escapeHTML(cardDetails.join(' · '))}</div>
+    ${content}${a.state!=='disabled'&&a.quota_limit?.active?`<div class="account-error">官方客户端已报告限额，约 ${date(a.quota_limit.blocked_until)} 后可重试。额度查询不完整时仍保留此提示。</div>`:''}${a.error&&a.loggedIn&&a.state!=='disabled'?`<div class="account-error">${escapeHTML(a.error)}</div>`:a.auto?.error&&a.loggedIn&&a.state!=='disabled'?`<div class="account-error">自动查询：${escapeHTML(a.auto.error)}</div>`:''}
+    <div class="card-divider"></div>${planHTML(a)}<div class="reset-card-row"><span class="ticket-icon">✧</span><span>重置卡</span><span class="card-state ${card.status}">${escapeHTML(cardLabel(card))}</span></div><div class="card-detail">${escapeHTML(cardDetails.join(' · '))}</div>
     <div class="card-controls"><button class="button secondary" data-action="cards" data-profile="${escapeHTML(a.profile)}" ${a.state==='disabled'?'disabled':''}>查看 / 查询</button><button class="button primary" data-action="use-card" data-profile="${escapeHTML(a.profile)}" ${a.state==='disabled'||!(card.usable_count>0)||card.stale||card.pending?'disabled':''}>使用重置卡</button></div>
-    <div class="account-footer"><span class="footer-source ${a.live?'live':''}"><i></i>${a.live?'跟随活动会话':a.loggedIn?'闲置时保留记录':'等待账号登录'}</span><span ${a.last_observed_at?`data-age="${a.last_observed_at}"`:''}>${a.last_observed_at?`${age(a.last_observed_at)}更新`:'尚无额度记录'}</span></div></article>`;
+    <div class="account-footer"><span class="footer-source ${a.live||a.delegated?'live':''}"><i></i>${a.live?'跟随活动会话':a.delegated?`委派任务运行中 · ${a.delegated} 个`:a.loggedIn?'闲置时保留记录':'等待账号登录'}</span><span ${a.last_observed_at?`data-age="${a.last_observed_at}"`:''}>${a.last_observed_at?`${age(a.last_observed_at)}更新`:'尚无额度记录'}</span></div></article>`;
 }
 function filteredAccounts() {
   const query=$('search').value.trim().toLowerCase(), filter=$('filter').value;
@@ -119,6 +144,43 @@ function renderResets() {
   $('reset-list').innerHTML=displayed.length?displayed.map(r=>`<div class="reset-row"><span class="reset-dot ${r.key==='seven_day'?'week':''}"></span><span class="reset-profile">${escapeHTML(r.profile)}</span><span class="reset-kind">${r.key==='five_hour'?'5 小时窗口':'7 天窗口'}</span><span class="reset-date">${date(r.time)}</span><span class="reset-remaining" data-countdown="${r.time}">${countdown(r.time)}</span></div>`).join(''):`<div class="loading-card">${pending.length?'已到重置时间，等待状态栏更新或手动刷新':'暂无已知的重置时间'}</div>`;
   if(future.length>6||pending.length) $('reset-list').insertAdjacentHTML('beforeend',`<div class="reset-more">${future.length>6?`另有 ${future.length-6} 个窗口将在更晚重置。 `:''}${pending.length?`${pending.length} 个窗口已到重置时间，待新数据确认。`:''}</div>`);
 }
+const jobLabels = {queued:'排队中',selecting:'正在挑账号',waiting:'等空账号',running:'运行中',completed:'已完成',failed:'失败',blocked:'没有空账号',cancelled:'已取消',timed_out:'到了时限',quota_exhausted:'额度用完',interrupted:'已中断',model_mismatch:'模型不符，已停'};
+const jobWaiting = ['queued','selecting','waiting'];
+function elapsed(from) {
+  const s=Math.max(0,Math.floor(now()-from)), h=Math.floor(s/3600), m=Math.floor(s%3600/60);
+  return h?`${h} 小时 ${m} 分`:`${m} 分`;
+}
+function accountQuota(name, limits) {
+  // The job's own session reading is the newest; otherwise the account card's.
+  const windows=limits?.windows||data.accounts.find(a=>a.profile===name)?.windows||{};
+  const part=(key,label)=>{const w=windows[key]; return w&&Number.isFinite(w.used_percentage)?`${label}剩 ${pct(Math.max(0,100-w.used_percentage))}%`:'';};
+  return [part('five_hour','5 小时'),part('seven_day','本周')].filter(Boolean).join(' · ');
+}
+function jobHTML(j) {
+  const running=j.status==='running';
+  // Long commands such as renders write nothing to the session for a while; 20 quiet minutes is worth a look.
+  const quiet=running&&j.alive&&j.activity_at&&now()-j.activity_at>1200;
+  const tone=running?(j.alive&&!quiet?'live':'warn'):j.status==='completed'?'done':jobWaiting.includes(j.status)?'wait':j.status==='interrupted'?'warn':'stop';
+  const label=running?(j.alive?(quiet?'运行中 · 久未动作':'运行中'):'进程已退出'):(jobLabels[j.status]||'状态未知');
+  const detail=[j.project, j.created_at?`${date(j.created_at)} 开始`:'', running&&j.created_at?`已运行 ${elapsed(j.created_at)}`:'', j.session?`会话 ${j.session}`:'', j.attempt>1?`第 ${j.attempt} 次`:'', j.continues?`已自动续做 ${j.continues} 次`:'', running&&j.shared?'与其他任务共用账号':''].filter(Boolean).join(' · ');
+  const note=j.auto_stop||(!running?j.reason:'');
+  const reason=note?`<small class="job-detail job-reason">${escapeHTML(note)}</small>`:'';
+  const quota=running&&j.account?accountQuota(j.account,j.limits):'';
+  const right=running?(j.activity_at?`最近动作 ${age(j.activity_at)}`:'等待第一步'):(j.updated_at?`${age(j.updated_at)}${jobWaiting.includes(j.status)?'更新':'结束'}`:'—');
+  return `<div class="reset-row job-row" title="${escapeHTML(j.reason||j.title||'')}"><span class="reset-dot job-${tone}"></span><span class="job-main"><span class="reset-profile">${escapeHTML(j.title||j.job)}</span><small class="job-detail">${escapeHTML(detail)}</small>${reason}</span><span class="job-state ${tone}">${escapeHTML(label)}<small>${j.account?`账号 ${escapeHTML(j.account)}`:'尚未分配账号'}</small>${quota?`<small class="job-quota">${escapeHTML(quota)}</small>`:''}</span><span class="reset-remaining" ${running&&j.activity_at?`data-activity="${j.activity_at}"`:''}>${escapeHTML(right)}</span></div>`;
+}
+function renderDelegations() {
+  const jobs=data.delegations||[];
+  const running=jobs.filter(j=>j.status==='running'&&j.alive).length;
+  const waiting=jobs.filter(j=>jobWaiting.includes(j.status)).length;
+  $('nav-delegations').textContent=running;
+  $('delegation-count').textContent=jobs.length?`${running} 个在跑${waiting?` · ${waiting} 个在等账号`:''} · 共 ${jobs.length} 个`:'';
+  const p=data.delegation_policy||{};
+  const rules=[p.share_when_short&&'账号不够时共用',p.wait_for_account&&'没号时排队',p.auto_continue&&'额度用完换号续做',p.enforce_model&&'模型不符即停',p.interactive_cap>0&&`主会话的号用到 ${p.interactive_cap}% 停`].filter(Boolean);
+  $('delegation-policy').textContent=rules.length?`自动：${rules.join(' · ')} · 续做守护${p.supervisor?'运行中':'未运行'}`:'未开启自动规则 · 最近 24 小时';
+  $('delegation-policy').classList.toggle('warn',!!(p.auto_continue&&!p.supervisor));
+  $('delegation-list').innerHTML=jobs.length?jobs.map(jobHTML).join(''):'<div class="loading-card">最近 24 小时没有委派任务</div>';
+}
 function render() {
   const accounts=data.accounts;
   $('nav-count').textContent=accounts.length;
@@ -137,11 +199,12 @@ function render() {
   const held=known.reduce((sum,a)=>sum+(a.reset_card.resets_left||0),0);
   $('summary-cards').textContent=known.length?usable:'—';
   $('summary-cards-note').textContent=`已查询持有 ${held} 次 · ${enabled.length-known.length} 个账号待确认`;
-  $('sync-note').textContent=data.busy?`正在查询 ${data.busy}；完成后只跟随状态栏。`:'网页每 5 秒读取最新记录；闲置账号不反复查询。';
+  const auto=data.auto_refresh;
+  $('sync-note').textContent=data.busy?`正在用 /usage 查询 ${data.busy}。`:auto?.running?`有会话或委派任务的账号每 ${Math.round(auto.busy_seconds/60)} 分钟、闲置账号每 ${Math.round(auto.idle_seconds/60)} 分钟自动查一次官方额度；委派会话每次请求都会回报。${auto.error?' '+auto.error:''}`:'网页每 5 秒读取最新记录。';
   $('refresh-all').disabled=!!data.busy;
   const icon=$('refresh-all').querySelector('.refresh-icon'); icon.classList.toggle('spinning',!!data.busy);
   $('error-banner').textContent=data.collector_error||''; $('error-banner').hidden=!data.collector_error;
-  renderAccounts(); renderResets(); if($('reset-dialog').open) renderInventory(); tick();
+  renderAccounts(); renderResets(); renderDelegations(); if($('reset-dialog').open) renderInventory(); tick();
 }
 function updatePrivacy() {
   $('privacy-toggle').textContent=privacy?'显示邮箱':'隐藏邮箱';
@@ -152,6 +215,8 @@ function tick() {
   document.querySelectorAll('[data-reset]').forEach(el=>{ const t=Number(el.dataset.reset); el.textContent=(t>now()?'重置倒计时 ':'')+countdown(t); el.classList.toggle('waiting',t<=now()); });
   document.querySelectorAll('[data-countdown]').forEach(el=>el.textContent=countdown(Number(el.dataset.countdown)));
   document.querySelectorAll('[data-age]').forEach(el=>el.textContent=age(Number(el.dataset.age))+'更新');
+  document.querySelectorAll('[data-activity]').forEach(el=>el.textContent='最近动作 '+age(Number(el.dataset.activity)));
+  document.querySelectorAll('[data-plan-end]').forEach(el=>el.textContent=remaining(Number(el.dataset.planEnd)));
 }
 async function fetchStatus() {
   if(fetching) return;

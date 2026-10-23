@@ -71,7 +71,7 @@ class InstallationTests(unittest.TestCase):
         self.assertEqual(json.loads((plugin/'.claude-plugin/plugin.json').read_text())['name'],
                          'auto-compaction-recovery')
         self.assertTrue((plugin/'hooks/register.js').is_file())
-        for command in ('claude-auto', 'claude-accounts', 'claude-quota'):
+        for command in ('claude-auto', 'claude-accounts', 'claude-quota', 'claude-delegate'):
             self.command(self.prefix/'bin'/command, '--help')
         self.command(self.prefix/'bin/claude-accounts', 'init')
         registry = json.loads((self.runtime/'accounts.json').read_text())
@@ -85,6 +85,13 @@ class InstallationTests(unittest.TestCase):
         self.install()
         self.assertEqual(before, (sentinel.read_bytes(), (self.runtime/'accounts.json').read_bytes(), self.native.read_bytes()))
         self.assertNotIn('.credentials.json', [p.name for p in self.prefix.rglob('*')])
+        delegate = self.prefix/'share/claude-auto/account-delegation'
+        self.assertTrue((delegate/'.mcp.json').is_file())
+        rpc = json.dumps({'jsonrpc': '2.0', 'id': 1, 'method': 'tools/list'})+'\n'
+        result = subprocess.run([sys.executable, str(delegate/'scripts/server.py')],
+                                input=rpc, env=self.env, capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(json.loads(result.stdout)['result']['tools']), 5)
 
     def test_installer_preflight_rejects_symlink_without_partial_upgrade(self):
         bindir = self.prefix/'bin'

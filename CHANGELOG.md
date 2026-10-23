@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Add optional cross-account delegation tools: verified quota and identity selection, exclusive account leases, independent native sessions, results, cancellation and explicit resumption. Preserve the native Agent tool and existing project permissions; default delegated tasks to read-only.
+
 - Avoid rewriting existing context objects and reuse process-local verification proofs for unchanged files during account rotation. Keep full history, final flushes and original agent identifiers; inode, device, mode, size, mtime or ctime changes invalidate cached proofs.
 - Reuse validated subagent terminal status instead of reparsing unchanged histories, and extend an already verified prefix hash when the file remains unchanged.
 - Report checkpoint progress, reuse/write counts and private rotation phase timings. First verification in a new process still reads file contents.

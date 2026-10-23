@@ -24,6 +24,7 @@ import uuid
 ORIGIN = 'https://api.anthropic.com'
 GRANT_ID = re.compile(r'[a-z0-9_-]{1,40}\Z')
 UUID = re.compile(r'[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}\Z')
+TOKEN = re.compile(r'[a-z0-9_]{1,64}\Z')
 WINDOWS = ('five_hour', 'seven_day', 'seven_day_opus', 'seven_day_sonnet', 'seven_day_overage_included')
 RESULTS = {
     'reset': '官方已确认额度重置。',
@@ -65,6 +66,10 @@ def integer(value):
     return isinstance(value, int) and not isinstance(value, bool) and value >= 0
 
 
+def token(value):
+    return value if isinstance(value, str) and TOKEN.fullmatch(value) else None
+
+
 def reason_text(reason):
     return REASONS.get(reason, '官方暂未允许使用，具体资格以官方页面为准')
 
@@ -102,6 +107,7 @@ class OfficialClient:
         self.headers = {'Authorization': 'Bearer '+token, 'anthropic-beta': 'oauth-2025-04-20',
                         'User-Agent': f'claude-cli/{version} (external, cli)',
                         'Accept': 'application/json', 'Content-Type': 'application/json'}
+        self.plan = None
 
     def request(self, path, payload=None):
         # Callers supply only fixed paths or a validated official organization UUID.
@@ -138,6 +144,10 @@ class OfficialClient:
         if not isinstance(email, str) or not 3 <= len(email) <= 320:
             raise CardError('identity', '官方未返回账号邮箱，无法安全使用卡片', 502)
         identity = {'account_id': account['uuid'], 'organization_id': org['uuid'], 'email': email}
+        # Kept apart from the identity: a renewal must not look like a different account.
+        self.plan = {'type': token(org.get('organization_type')), 'billing': token(org.get('billing_type')),
+                     'status': token(org.get('subscription_status')),
+                     'started_at': timestamp(org.get('subscription_created_at'))}
         return identity, self.request('/api/oauth/usage?cedar_ember=1&skip_spend=1')
 
     def redeem(self, identity, grant_id, request_id):
@@ -293,7 +303,8 @@ class ResetCards:
             client = self.client_factory(registry, name)
             identity, payload = client.read()
             card = normalize(identity, payload, time.time())
-            self.monitor.record_official_usage(name, identity, payload, card['checked_at'], started_at)
+            self.monitor.record_official_usage(name, identity, payload, card['checked_at'], started_at,
+                                               getattr(client, 'plan', None))
             with self.lock:
                 self.inventory[name] = card
                 self.save(self.inventory_path, self.inventory)

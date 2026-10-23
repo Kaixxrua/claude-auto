@@ -1,0 +1,6 @@
+{
+  "name": "account-delegation",
+  "version": "0.1.0",
+  "description": "Optional independent Claude tasks on verified available local accounts.",
+  "author": {"name": "claude-auto contributors"}
+}

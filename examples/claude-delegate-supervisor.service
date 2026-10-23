@@ -1,0 +1,18 @@
+[Unit]
+Description=Claude Auto delegation supervisor (continues delegated jobs that stopped early)
+
+[Service]
+Type=exec
+WorkingDirectory=%h
+ExecStart=/usr/bin/python3 %h/.local/bin/claude-delegate supervise --interval 30
+Environment=PYTHONUNBUFFERED=1
+# Delegated sessions find their tools through this PATH when the supervisor starts them.
+Environment=PATH=%h/.local/bin:%h/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+UMask=0077
+# Workers started here must outlive a supervisor restart.
+KillMode=process
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target
