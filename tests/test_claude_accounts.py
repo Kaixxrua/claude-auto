@@ -258,7 +258,7 @@ class AccountsTests(unittest.TestCase):
             path=m.add_profile(registry,'second')
             self.assertFalse((path/'.credentials.json').exists())
             self.assertTrue((path/'projects').is_symlink())
-            self.assertEqual((path/'settings.json').resolve(),base/'settings.json')
+            self.assertEqual((path/'settings.json').resolve(),(base/'settings.json').resolve())
             with self.assertRaises(RuntimeError): m.add_profile(registry,'../escape')
         m.ROOT=previous
 
@@ -276,7 +276,7 @@ class AccountsTests(unittest.TestCase):
             for name in names[1:]:
                 profile=Path(registry['profiles'][name])
                 self.assertFalse((profile/'.credentials.json').exists())
-                self.assertEqual((profile/'settings.json').resolve(),base/'settings.json')
+                self.assertEqual((profile/'settings.json').resolve(),(base/'settings.json').resolve())
             with self.assertRaises(RuntimeError): m.prepare_profiles(registry,5)
             self.assertEqual(len(registry['profiles']),12)
 
@@ -602,7 +602,8 @@ class AccountsTests(unittest.TestCase):
 class ContextTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
-        self.root = Path(self.temp.name)
+        # Manifests record resolved paths; Windows TEMP may be an 8.3 alias such as RUNNER~1.
+        self.root = Path(self.temp.name).resolve()
         self.previous_root = m.ROOT
         m.ROOT = self.root/'accounts'
         self.profile = self.root/'main'
@@ -641,8 +642,9 @@ class ContextTests(unittest.TestCase):
         scratch=m.oslayer.claude_temp_root()/'rotation-test'/self.sid/'scratchpad'
         scratch.mkdir(parents=True)
         self.addCleanup(shutil.rmtree,scratch.parent)
+        # Claude Code reports the scratchpad under TEMP as given; the manifest resolves it.
         self.state['scratchpads']=[str(scratch)]
-        return scratch
+        return scratch.resolve()
 
     def test_scratch_links_preserved_without_reading_external_targets(self):
         scratch=self.scratch()
