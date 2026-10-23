@@ -67,7 +67,7 @@ def private_dir(path):
 
 def read_json(path, default=None):
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        return json.loads(oslayer.read_bytes(path))
     except FileNotFoundError:
         return default
 

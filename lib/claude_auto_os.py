@@ -111,6 +111,19 @@ def replace(source, target):
             time.sleep(.01*min(attempt+1, 10))
 
 
+def read_bytes(path):
+    """Path.read_bytes for a file other processes replace(). On Windows the replaced file
+    stays delete-pending while anything, such as a virus scanner, still has it open, and
+    opening the name is refused until then."""
+    for attempt in range(60):
+        try:
+            return Path(path).read_bytes()
+        except PermissionError:
+            if not WINDOWS or attempt == 59:
+                raise
+            time.sleep(.01*min(attempt+1, 10))
+
+
 def lock(fd, blocking=True):
     """Exclusive lock on an open file, released when it is closed. False when another
     holder has it and blocking is off."""

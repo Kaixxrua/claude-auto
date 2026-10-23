@@ -103,7 +103,7 @@ class OfficialClient:
         if name not in registry['profiles'] or name in registry.get('disabled', {}):
             raise CardError('disabled', '账号不存在或已停用，不会查询或使用卡片')
         try:
-            auth = json.loads((Path(registry['profiles'][name])/'.credentials.json').read_bytes())['claudeAiOauth']
+            auth = json.loads(oslayer.read_bytes(Path(registry['profiles'][name])/'.credentials.json'))['claudeAiOauth']
             token = auth['accessToken']
             if not isinstance(token, str) or not token or 'user:profile' not in auth.get('scopes', []):
                 raise ValueError()
@@ -227,7 +227,7 @@ class ResetCards:
 
     def load(self, path, journal=False):
         try:
-            value = json.loads(path.read_bytes())
+            value = json.loads(oslayer.read_bytes(path))
             if not isinstance(value, dict) or not all(isinstance(v, dict) for v in value.values()):
                 raise ValueError()
             return value

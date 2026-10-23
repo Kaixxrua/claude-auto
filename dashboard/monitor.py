@@ -48,7 +48,7 @@ MONTHS = {name: i for i, name in enumerate(
 
 def load_json(path, default=None):
     try:
-        return json.loads(Path(path).read_bytes())
+        return json.loads(oslayer.read_bytes(path))
     except (OSError, ValueError):
         return copy.deepcopy(default)
 
@@ -204,7 +204,7 @@ def oauth_windows(payload, at):
 def token_expiry(registry, name):
     """Expiry of the stored login, read without using the token."""
     with contextlib.suppress(OSError, ValueError, KeyError, TypeError):
-        auth = json.loads((Path(registry['profiles'][name])/'.credentials.json').read_bytes())['claudeAiOauth']
+        auth = json.loads(oslayer.read_bytes(Path(registry['profiles'][name])/'.credentials.json'))['claudeAiOauth']
         if finite(auth.get('expiresAt')):
             return auth['expiresAt']/1000
     return None

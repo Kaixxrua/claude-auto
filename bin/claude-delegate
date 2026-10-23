@@ -659,7 +659,7 @@ class Jobs:
         report = []
         for path in targets:
             try:
-                settings = json.loads(path.read_text(encoding='utf-8')) if path.exists() else {}
+                settings = json.loads(oslayer.read_bytes(path)) if path.exists() else {}
                 if not isinstance(settings, dict):
                     raise ValueError('not an object')
             except (OSError, ValueError) as exc:
