@@ -31,16 +31,18 @@ jobs:
         shell: python
         run: |
           # python -m unittest discover -s tests -v, plus one annotation per failing test.
+          # Guarded: Windows multiprocessing re-imports this script in each spawned worker.
           import os, sys, unittest
-          sys.path[0] = os.getcwd()
-          result = unittest.main(module=None, argv=['unittest', 'discover', '-s', 'tests', '-v'], exit=False).result
           def escape(text, *extra):
               for char in ('%', '\r', '\n') + extra:
                   text = text.replace(char, '%{:02X}'.format(ord(char)))
               return text
-          for test, trace in result.failures + result.errors:
-              print('::error title={}::{}'.format(escape(test.id(), ':', ','), escape(trace[-3000:])), flush=True)
-          sys.exit(not result.wasSuccessful())
+          if __name__ == '__main__':
+              sys.path[0] = os.getcwd()
+              result = unittest.main(module=None, argv=['unittest', 'discover', '-s', 'tests', '-v'], exit=False).result
+              for test, trace in result.failures + result.errors:
+                  print('::error title={}::{}'.format(escape(test.id(), ':', ','), escape(trace[-3000:])), flush=True)
+              sys.exit(not result.wasSuccessful())
       - name: Compaction recovery tests (offline public API fixtures)
         run: node --test tests/test_compaction.mjs
       - name: Verify distributable files
@@ -68,15 +70,17 @@ jobs:
         shell: python
         run: |
           # python -m unittest discover -s tests -v, plus one annotation per failing test.
+          # Guarded: Windows multiprocessing re-imports this script in each spawned worker.
           import os, sys, unittest
-          sys.path[0] = os.getcwd()
-          result = unittest.main(module=None, argv=['unittest', 'discover', '-s', 'tests', '-v'], exit=False).result
           def escape(text, *extra):
               for char in ('%', '\r', '\n') + extra:
                   text = text.replace(char, '%{:02X}'.format(ord(char)))
               return text
-          for test, trace in result.failures + result.errors:
-              print('::error title={}::{}'.format(escape(test.id(), ':', ','), escape(trace[-3000:])), flush=True)
-          sys.exit(not result.wasSuccessful())
+          if __name__ == '__main__':
+              sys.path[0] = os.getcwd()
+              result = unittest.main(module=None, argv=['unittest', 'discover', '-s', 'tests', '-v'], exit=False).result
+              for test, trace in result.failures + result.errors:
+                  print('::error title={}::{}'.format(escape(test.id(), ':', ','), escape(trace[-3000:])), flush=True)
+              sys.exit(not result.wasSuccessful())
       - name: Verify distributable files
         run: python scripts/check_release.py

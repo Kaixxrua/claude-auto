@@ -202,9 +202,13 @@ time.sleep(30)
 '''
 
 
-def write_quota_worker(state_dir, name, blocked_until, barrier):
-    barrier.wait(timeout=8)
+def write_quota_worker(state_dir, name, blocked_until, barrier, stage):
+    # stage tells a failing test how far this worker got.
+    Path(stage).write_text('barrier')
+    barrier.wait(timeout=30)
+    Path(stage).write_text('record')
     m.record_quota(Path(state_dir),name,blocked_until)
+    Path(stage).write_text('done')
 
 
 class AccountsTests(unittest.TestCase):
@@ -341,13 +345,18 @@ class AccountsTests(unittest.TestCase):
             writes += [('shared',now+1200+i*60) for i in range(4)]
             context=multiprocessing.get_context('spawn' if WINDOWS else 'fork')
             barrier=context.Barrier(len(writes))
-            processes=[context.Process(target=write_quota_worker,args=(str(state),name,reset,barrier))
-                       for name,reset in writes]
+            stages=[Path(temp)/f'stage{i}' for i in range(len(writes))]
+            # Windows spawns a fresh interpreter per worker; a busy CI machine needs time.
+            processes=[context.Process(target=write_quota_worker,args=(str(state),name,reset,barrier,str(stage)))
+                       for (name,reset),stage in zip(writes,stages)]
             try:
+                started=time.monotonic()
                 for process in processes: process.start()
-                for process in processes:
-                    process.join(timeout=12)
-                    self.assertEqual(process.exitcode,0)
+                for process in processes: process.join(timeout=max(0,started+60-time.monotonic()))
+                progress=[(process.exitcode,stage.read_text() if stage.exists() else 'starting')
+                          for process,stage in zip(processes,stages)]
+                self.assertEqual([code for code,_ in progress],[0]*len(processes),
+                                 f'{time.monotonic()-started:.1f}s, {barrier.n_waiting} at the barrier: {progress}')
             finally:
                 for process in processes:
                     if process.is_alive(): process.terminate(); process.join(timeout=3)
