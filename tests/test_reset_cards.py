@@ -74,6 +74,14 @@ class CardTests(unittest.TestCase):
         self.assertEqual(a['windows']['five_hour']['source'],'official_oauth_api')
         self.assertEqual(a['state'],'limited')
 
+    def test_query_records_plan_and_billing_period(self):
+        self.fake.plan={'type':'claude_pro','billing':'apple_subscription','status':None,'started_at':time.time()-86400}
+        self.fake.payload['cedar_ember']['event_props']={'billing_period':'monthly','billing_path':'apple'}
+        self.cards.query('account06')
+        a=next(a for a in self.mon.snapshot()['accounts'] if a['profile']=='account06')
+        self.assertEqual((a['plan']['type'],a['plan']['period'],a['plan']['renewals']),('claude_pro','monthly',0))
+        self.assertGreater(a['plan']['ends_at'],time.time()+27*86400)
+
     def test_disabled_never_loads_credentials_or_calls_client(self):
         with patch.object(self.cards,'client_factory',side_effect=AssertionError('disabled API')):
             for method,args in [(self.cards.query,('main',)),(self.cards.prepare,('main',GID))]:
@@ -315,6 +323,21 @@ class TransportTests(unittest.TestCase):
             with patch.object(r.urllib.request,'build_opener',side_effect=OSError(secret)):
                 with self.assertRaises(r.CardError) as e:client.request('/api/oauth/profile')
             self.assertNotIn(secret,str(e.exception))
+
+    def test_profile_plan_is_kept_apart_from_identity(self):
+        with tempfile.TemporaryDirectory() as td:
+            (Path(td)/'.credentials.json').write_text(json.dumps({'claudeAiOauth':{'accessToken':'secret','scopes':['user:profile']}}))
+            with patch.object(r,'client_version',return_value='2.1.295'):
+                client=r.OfficialClient({'profiles':{'account06':td},'claude':'/bin/true'},'account06')
+            profile={'account':{'uuid':IDENTITY['account_id'],'email':IDENTITY['email']},
+                     'organization':{'uuid':IDENTITY['organization_id'],'organization_type':'claude_pro',
+                                     'billing_type':'apple_subscription','subscription_status':'<b>active</b>',
+                                     'subscription_created_at':'2026-09-29T04:13:34.325075Z'}}
+            with patch.object(client,'request',side_effect=lambda path,*_:profile if path=='/api/oauth/profile' else usage()):
+                identity,payload=client.read()
+        self.assertEqual(identity,IDENTITY)
+        self.assertEqual(client.plan,{'type':'claude_pro','billing':'apple_subscription','status':None,
+                                      'started_at':datetime(2026,9,29,4,13,34,325075,tzinfo=timezone.utc).timestamp()})
 
     def test_no_redirect(self):
         self.assertIsNone(r.NoRedirect().redirect_request(None,None,302,'',{},'https://evil.test'))

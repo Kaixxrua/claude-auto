@@ -2,6 +2,7 @@ import contextlib
 from datetime import datetime, timezone
 import http.client
 import json
+import os
 from pathlib import Path
 import tempfile
 import threading
@@ -32,6 +33,8 @@ class Adapter:
 
 class MonitorTests(unittest.TestCase):
     def setUp(self):
+        patch=mock.patch.object(m,'PROBE_RETRY_SECONDS',0)
+        patch.start();self.addCleanup(patch.stop)
         self.temp=tempfile.TemporaryDirectory()
         self.root=Path(self.temp.name)
         m.save_json(self.root/'accounts.json',{'version':1,'claude':'/bin/true','profiles':{'main':str(self.root/'main')}})
@@ -195,6 +198,58 @@ class MonitorTests(unittest.TestCase):
         self.mon.records['main']['email']='different@example.test'
         self.assertEqual(self.mon.snapshot()['accounts'][0]['reset_card']['status'],'unknown')
 
+    def test_plan_period_ends_at_the_next_anniversary(self):
+        t=lambda *a:datetime(*a,tzinfo=UTC).timestamp()
+        plan={'type':'claude_pro','billing':'apple_subscription','status':None,'period':'monthly','started_at':t(2026,9,29,4,13,34)}
+        view=m.plan_view(plan,t(2026,10,21))
+        self.assertEqual((view['ends_at'],view['renewals']),(t(2026,10,29,4,13,34),0))
+        self.assertEqual(m.plan_view(plan,t(2026,10,29,4,13,34))['ends_at'],t(2026,11,29,4,13,34))
+        # Still paid after two anniversaries: renewed twice, this period ends at the third.
+        view=m.plan_view({**plan,'started_at':t(2026,8,18,2,11,58)},t(2026,10,21))
+        self.assertEqual((view['ends_at'],view['renewals']),(t(2026,11,18,2,11,58),2))
+        # Month ends clamp without drifting off the original day.
+        self.assertEqual(m.plan_view({**plan,'started_at':t(2026,1,31,8)},t(2026,2,1))['ends_at'],t(2026,2,28,8))
+        self.assertEqual(m.plan_view({**plan,'started_at':t(2026,1,31,8)},t(2026,3,1))['ends_at'],t(2026,3,31,8))
+        self.assertEqual(m.plan_view({**plan,'period':'annual','started_at':t(2025,11,5)},t(2026,10,21))['ends_at'],t(2026,11,5))
+        self.assertEqual(m.plan_view({**plan,'period':None},t(2026,10,21))['ends_at'],t(2026,10,29,4,13,34))
+        for other in ({'type':'claude_free'},{'billing':'stripe_subscription_contracted'},{'started_at':None}):
+            view=m.plan_view({**plan,**other},t(2026,10,21))
+            self.assertEqual((view['ends_at'],view['renewals']),(None,None))
+        self.assertIsNone(m.plan_view(None,t(2026,10,21)))
+
+    def test_official_plan_keeps_known_period_and_follows_identity(self):
+        start=time.time()-40*86400
+        plan={'type':'claude_pro','billing':'apple_subscription','status':None,'started_at':start}
+        identity={'account_id':'a','organization_id':'o','email':'main@example.test'}
+        annual={'cedar_ember':{'event_props':{'billing_period':'annual'}}}
+        self.mon.record_official_usage('main',identity,annual,time.time(),plan=plan)
+        a=self.mon.snapshot()['accounts'][0]
+        self.assertEqual((a['plan']['period'],a['plan']['source'],a['plan']['renewals']),('annual','official_oauth_api',0))
+        self.assertAlmostEqual(a['plan']['ends_at'],m.add_months(datetime.fromtimestamp(start,UTC),12).timestamp())
+        # A response without the period keeps the one this identity reported before.
+        self.mon.record_official_usage('main',identity,{},time.time(),plan=plan)
+        self.assertEqual(self.mon.snapshot()['accounts'][0]['plan']['period'],'annual')
+        self.mon.record_official_usage('main',{**identity,'email':'other@example.test'},{},time.time(),plan=plan)
+        self.assertIsNone(self.mon.snapshot()['accounts'][0]['plan']['period'])
+        self.mon.record_official_usage('main',identity,{},time.time())
+        self.assertIsNone(self.mon.snapshot()['accounts'][0]['plan'])
+
+    def test_disabled_account_plan_comes_from_client_profile(self):
+        registry=m.load_json(self.root/'accounts.json')
+        registry['disabled']={'main':{'reason':'用户确认封禁'}}
+        m.save_json(self.root/'accounts.json',registry)
+        start=time.time()-3*86400
+        account={'emailAddress':'main@example.test','organizationType':'claude_pro','billingType':'apple_subscription',
+                 'subscriptionCreatedAt':datetime.fromtimestamp(start,UTC).isoformat(),'profileFetchedAt':1792216540884}
+        m.save_json(self.root/'main/.claude.json',{'projects':{},'oauthAccount':account})
+        plan=self.mon.snapshot()['accounts'][0]['plan']
+        self.assertEqual((plan['source'],plan['type'],plan['period'],plan['checked_at']),('client_profile','claude_pro',None,1792216540.884))
+        self.assertAlmostEqual(plan['ends_at'],m.add_months(datetime.fromtimestamp(start,UTC),1).timestamp())
+        self.assertNotIn('email',plan)
+        # Another login in that directory is not this account's plan.
+        m.save_json(self.root/'main/.claude.json',{'oauthAccount':{**account,'emailAddress':'other@example.test'}})
+        self.assertIsNone(self.mon.snapshot()['accounts'][0]['plan'])
+
     def test_card_validation_and_private_storage(self):
         with self.assertRaises(ValueError):self.mon.set_card({'profile':'main','status':'available','expires_at':float('nan')})
         self.mon.set_card({'profile':'main','status':'none'})
@@ -219,5 +274,99 @@ class MonitorTests(unittest.TestCase):
             self.assertEqual(request('POST','/api/reset-card',payload,{'Content-Type':'application/json','Origin':'http://'+host})[0],200)
         finally:
             server.shutdown();server.server_close();thread.join()
+
+
+class AutomaticQuotaTests(unittest.TestCase):
+    def setUp(self):
+        patch=mock.patch.object(m,'PROBE_RETRY_SECONDS',0)
+        patch.start();self.addCleanup(patch.stop)
+        self.temp=tempfile.TemporaryDirectory();self.addCleanup(self.temp.cleanup)
+        self.root=Path(self.temp.name)
+        m.save_json(self.root/'accounts.json',{'version':1,'claude':'/bin/true','profiles':{'main':str(self.root/'main'),'spare':str(self.root/'spare')}})
+        self.mon=m.Monitor(self.root,Adapter(),self.root)
+        now=time.time()
+        self.mon.records={n:{'loggedIn':True,'email':n+'@example.test','windows':{
+            'five_hour':{'used_percentage':40,'resets_at':now+3600,'observed_at':now-600,'source':'official_cli_usage'},
+            'seven_day':{'used_percentage':10,'resets_at':now+86400,'observed_at':now-600,'source':'official_cli_usage'}}} for n in ('main','spare')}
+
+    def weekly(self):
+        return {'seven_day':{'used_percentage':5,'resets_at':time.time()+86400,'observed_at':time.time(),'source':'official_cli_usage'}}
+
+    def test_unstarted_session_window_is_inferred_only_from_a_known_reset(self):
+        now=time.time()
+        with mock.patch.object(m,'probe_usage',side_effect=lambda *a,**k:self.weekly()) as probe:
+            past=m.probe_complete('x',{},'.',known={'five_hour':{'used_percentage':100,'resets_at':now-5}})
+            self.assertEqual(probe.call_count,2)
+            self.assertEqual((past['five_hour']['used_percentage'],past['five_hour']['inferred']),(0.0,'session_not_started'))
+            self.assertNotIn('five_hour',m.probe_complete('x',{},'.',known={'five_hour':{'used_percentage':100,'resets_at':now+600}}))
+            self.assertNotIn('five_hour',m.probe_complete('x',{},'.',known={}))
+            self.assertIn('five_hour',m.probe_complete('x',{},'.',known={'five_hour':{'used_percentage':0,'resets_at':None}}))
+        both={**self.weekly(),'five_hour':{'used_percentage':3,'resets_at':now+60,'observed_at':now,'source':'official_cli_usage'}}
+        with mock.patch.object(m,'probe_usage',return_value=both) as probe:
+            self.assertEqual(m.probe_complete('x',{},'.')['five_hour']['used_percentage'],3)
+            self.assertEqual(probe.call_count,1)
+
+    def job(self, **values):
+        job_id=values.pop('job_id','a'*32)
+        d={'job_id':job_id,'title':'T','status':'running','account':'main','attempt':1,'session_id':'s'*36,
+           'created_at':time.time(),'updated_at':time.time(),'worker_pid':os.getpid(),'worker_start':m.process_ticks(os.getpid()),
+           'native_pid':os.getpid(),'native_start':m.process_ticks(os.getpid()),**values}
+        m.save_json(self.root/'state/delegation/jobs'/job_id/'job.json',d)
+        return self.root/'state/delegation/jobs'/job_id
+
+    def test_delegated_session_reading_updates_its_account(self):
+        folder=self.job()
+        reset=time.time()+1800
+        event={'type':'rate_limit_event','rate_limit_info':{'status':'allowed_warning','unifiedWindows':{
+            'five_hour':{'utilization':0.93,'resetsAt':reset},'seven_day':{'utilization':0.21,'resetsAt':reset+86400}}}}
+        (folder/'events-1.jsonl').write_text('{"type":"system"}\n'+json.dumps(event,separators=(',',':'))+'\n{"type":"assistant","message":{}}\n')
+        snap=self.mon.snapshot()
+        a=next(x for x in snap['accounts'] if x['profile']=='main')
+        self.assertEqual((a['windows']['five_hour']['used_percentage'],a['windows']['five_hour']['source']),(93.0,'delegated_session'))
+        self.assertEqual(a['windows']['five_hour']['resets_at'],reset)
+        self.assertEqual(a['delegated'],1)
+        self.assertEqual(snap['delegations'][0]['limits']['status'],'allowed_warning')
+
+    def test_waiting_and_dead_worker_states(self):
+        self.job(job_id='b'*32,status='waiting',account=None,native_pid=None)
+        self.job(job_id='c'*32,status='selecting',account=None,native_pid=None,worker_pid=2**22+7,worker_start='1')
+        states={j['job'][:1]:j['status'] for j in m.delegation_jobs(self.root,time.time())}
+        self.assertEqual(states,{'b':'waiting','c':'interrupted'})
+
+    def test_policy_flags_and_supervisor_heartbeat(self):
+        m.save_json(self.root/'state/delegation/policy.json',{'share_when_short':True,'auto_continue':True,'retry_seconds':60})
+        p=m.delegation_policy(self.root,time.time())
+        self.assertEqual((p['share_when_short'],p['auto_continue'],p['wait_for_account'],p['supervisor']),(True,True,False,False))
+        m.save_json(self.root/'state/delegation/supervisor.json',{'pid':os.getpid(),'start':m.process_ticks(os.getpid()),'at':time.time()})
+        self.assertTrue(m.delegation_policy(self.root,time.time())['supervisor'])
+
+    def test_busy_accounts_poll_each_minute_and_resets_trigger_a_read(self):
+        registry=self.mon.load_registry();now=time.time()
+        self.mon.official={'main':{'next_at':now+200,'attempted_at':now-61},'spare':{'next_at':now+100,'attempted_at':now-10}}
+        self.assertEqual(self.mon.official_next(registry,{'main'},now),('main',now-1))
+        self.assertEqual(self.mon.official_next(registry,set(),now),('spare',now+100))
+        # Reset after the last read: read again right away.
+        self.mon.records['spare']['windows']['five_hour']['resets_at']=now-8
+        name,due=self.mon.official_next(registry,set(),now)
+        self.assertEqual(name,'spare');self.assertLessEqual(due,now)
+
+    def test_official_read_success_failure_and_expired_login(self):
+        registry=self.mon.load_registry()
+        with mock.patch.object(self.mon.reset_cards,'query') as query:
+            self.mon.poll_official(registry,'main',True)
+        query.assert_called_once_with('main')
+        state=self.mon.official['main']
+        self.assertIsNone(state['error']);self.assertAlmostEqual(state['next_at']-time.time(),m.OFFICIAL_BUSY_SECONDS,delta=2)
+        with mock.patch.object(self.mon.reset_cards,'query',side_effect=m.CardError('http_401','登录已失效',502)):
+            self.mon.poll_official(registry,'main',True)
+        self.assertEqual(state['failures'],1);self.assertIn('main',self.mon.requested)
+        self.assertAlmostEqual(state['next_at']-time.time(),120,delta=2)
+        self.mon.requested.clear()
+        (self.root/'spare').mkdir()
+        m.save_json(self.root/'spare/.credentials.json',{'claudeAiOauth':{'expiresAt':(time.time()-5)*1000}})
+        with mock.patch.object(self.mon.reset_cards,'query') as query:
+            self.mon.poll_official(registry,'spare',False)
+        query.assert_not_called()
+        self.assertIn('spare',self.mon.requested)
 
 if __name__=='__main__':unittest.main(verbosity=2)

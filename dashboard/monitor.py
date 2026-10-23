@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import calendar
 import contextlib
 import copy
 from datetime import datetime, timedelta, timezone
@@ -28,7 +29,7 @@ import threading
 import time
 from urllib.parse import urlsplit
 import uuid
-from reset_cards import ResetCards, CardError, timestamp
+from reset_cards import ResetCards, CardError, OfficialClient, timestamp, token
 
 VERSION = '1.1.1'
 HERE = Path(__file__).resolve().parent
@@ -70,6 +71,220 @@ def save_json(path, value):
 
 def finite(value):
     return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+
+
+DELEGATION_ACTIVE = ('queued', 'selecting', 'waiting', 'running')
+OFFICIAL_BUSY_SECONDS = 60
+OFFICIAL_IDLE_SECONDS = 240
+OFFICIAL_MAX_BACKOFF = 900
+PROBE_RETRY_SECONDS = 5
+PAID_PLANS = ('claude_pro', 'claude_max', 'claude_team', 'claude_enterprise')
+# Consumer subscriptions renew on the anniversary of their start; contracts do not follow it.
+RENEWING_BILLING = ('apple_subscription', 'google_play_subscription', 'stripe_subscription')
+PLAN_MONTHS = {'monthly': 1, 'annual': 12}
+_session_cache = {}
+_plan_cache = {}
+
+
+def process_ticks(pid):
+    """Linux start ticks, compared the same way claude-delegate does, so a reused PID never counts as the job."""
+    try:
+        fields = Path(f'/proc/{int(pid)}/stat').read_text().rsplit(')', 1)[1].split()
+        return None if fields[0] == 'Z' else fields[19]
+    except (OSError, ValueError, IndexError, TypeError):
+        return None
+
+
+def session_limits(path, tail=1 << 20):
+    """Latest rate_limit_event in a delegated print session's output: the official per-response
+    quota, as the status line shows it for interactive clients. Utilization is a fraction there."""
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    cached = _session_cache.get(str(path))
+    if cached and cached[0] == (stat.st_size, stat.st_mtime_ns):
+        return cached[1]
+    value = None
+    with contextlib.suppress(OSError):
+        with path.open('rb') as stream:
+            stream.seek(max(0, stat.st_size-tail))
+            lines = stream.read().split(b'\n')
+        for line in reversed(lines):
+            if b'"rate_limit_event"' not in line[:64]:
+                continue
+            with contextlib.suppress(ValueError, AttributeError, TypeError, KeyError):
+                info = json.loads(line)['rate_limit_info']
+                windows = {}
+                for key in ('five_hour', 'seven_day'):
+                    w = info['unifiedWindows'].get(key)
+                    if isinstance(w, dict) and finite(w.get('utilization')) and 0 <= w['utilization'] <= 2:
+                        reset = w.get('resetsAt')
+                        windows[key] = {'used_percentage': round(min(w['utilization'], 1)*100, 1),
+                                        'resets_at': reset if finite(reset) else None}
+                if info.get('status') == 'rejected' and info.get('rateLimitType') in windows:
+                    windows[info['rateLimitType']]['used_percentage'] = 100.0
+                if windows:
+                    value = {'windows': windows, 'status': info.get('status'), 'at': stat.st_mtime}
+                    break
+    if len(_session_cache) > 64:
+        _session_cache.clear()
+    _session_cache[str(path)] = ((stat.st_size, stat.st_mtime_ns), value)
+    return value
+
+
+def delegation_jobs(root, now, keep=86400, limit=12):
+    """Cross-account delegated jobs as summaries only; prompts and reports stay in their private files."""
+    jobs = []
+    for path in (Path(root)/'state/delegation/jobs').glob('*/job.json'):
+        d = load_json(path)
+        if not isinstance(d, dict) or not isinstance(d.get('job_id'), str):
+            continue
+        status = d.get('status')
+        updated = d['updated_at'] if finite(d.get('updated_at')) else 0
+        if status not in DELEGATION_ACTIVE and now - updated > keep:
+            continue
+        alive = bool(d.get('native_pid')) and process_ticks(d['native_pid']) == d.get('native_start')
+        worker = bool(d.get('worker_pid')) and process_ticks(d['worker_pid']) == d.get('worker_start')
+        if status in DELEGATION_ACTIVE and d.get('worker_pid') and not worker:
+            status = 'interrupted'
+        # The session history is written on every model turn and tool result: the best "still working" signal.
+        activity = None
+        if d.get('history_root') and isinstance(d.get('session_id'), str):
+            with contextlib.suppress(OSError):
+                times = [p.stat().st_mtime for p in Path(d['history_root']).glob(f"*/{d['session_id']}.jsonl")]
+                activity = max(times) if times else None
+        limits = None
+        if alive:
+            limits = session_limits(path.parent/f"events-{d.get('attempt')}.jsonl")
+            saved = d.get('session_limits')
+            if not limits and isinstance(saved, dict) and isinstance(saved.get('windows'), dict) and finite(saved.get('at')):
+                limits = {'windows': saved['windows'], 'status': saved.get('status'), 'at': saved['at']}
+        jobs.append({'job': d['job_id'][:8], 'title': d.get('title'), 'status': status, 'reason': d.get('reason'),
+                     'account': d.get('account'), 'attempt': d.get('attempt'), 'mode': d.get('mode'),
+                     'model': d.get('model'), 'project': Path(d['cwd']).name if d.get('cwd') else None,
+                     'session': d['session_id'][:8] if isinstance(d.get('session_id'), str) else None,
+                     'created_at': d.get('created_at'), 'updated_at': updated or None,
+                     'activity_at': activity, 'alive': alive, 'permission_denials': d.get('permission_denials'),
+                     'shared': d.get('shared') is True, 'continues': d.get('continues') or 0,
+                     'auto_stop': d.get('auto_stop'), 'limits': limits})
+    # Active jobs first in launch order, then the most recently finished.
+    jobs.sort(key=lambda j: (0, j['created_at'] or 0) if j['status'] in DELEGATION_ACTIVE else (1, -(j['updated_at'] or 0)))
+    return jobs[:limit]
+
+
+def delegation_policy(root, now):
+    """Which automatic behaviours the delegation policy turns on, and whether the supervisor runs."""
+    base = Path(root)/'state/delegation'
+    raw = load_json(base/'policy.json', {})
+    raw = raw if isinstance(raw, dict) else {}
+    value = {key: raw.get(key) is True for key in
+             ('share_when_short', 'wait_for_account', 'auto_continue', 'enforce_model', 'avoid_interactive_accounts')}
+    cap = raw.get('interactive_cap')
+    value['interactive_cap'] = cap if type(cap) is int and 0 < cap <= 100 else 0
+    beat = load_json(base/'supervisor.json', {})
+    beat = beat if isinstance(beat, dict) else {}
+    value['supervisor'] = bool(finite(beat.get('at')) and now - beat['at'] < 180 and beat.get('pid')
+                               and process_ticks(beat['pid']) == beat.get('start'))
+    return value
+
+
+def oauth_windows(payload, at):
+    """Windows from the official usage API, in the record format /usage readings use."""
+    windows = {}
+    for key in ('five_hour', 'seven_day', 'seven_day_opus', 'seven_day_sonnet'):
+        raw = payload.get(key)
+        if not isinstance(raw, dict):
+            continue
+        used, reset = raw.get('utilization'), timestamp(raw.get('resets_at'))
+        if not finite(used) or not 0 <= used <= 100:
+            continue
+        windows[key] = {'used_percentage': used, 'resets_at': reset,
+                        'reset_precision': 'second', 'observed_at': at,
+                        'source': 'official_oauth_api'}
+    return windows
+
+
+def token_expiry(registry, name):
+    """Expiry of the stored login, read without using the token."""
+    with contextlib.suppress(OSError, ValueError, KeyError, TypeError):
+        auth = json.loads((Path(registry['profiles'][name])/'.credentials.json').read_text())['claudeAiOauth']
+        if finite(auth.get('expiresAt')):
+            return auth['expiresAt']/1000
+    return None
+
+
+def billing_period(payload):
+    """Monthly or annual, from the reset-card block of the official usage response."""
+    card = payload.get('cedar_ember') if isinstance(payload, dict) else None
+    props = card.get('event_props') if isinstance(card, dict) else None
+    value = props.get('billing_period') if isinstance(props, dict) else None
+    return value if value in PLAN_MONTHS else None
+
+
+def client_plan(directory):
+    """The official client's copy of its last profile read. It covers accounts this monitor
+    no longer queries, such as disabled ones."""
+    directory = Path(directory)
+    path = Path.home()/'.claude.json' if directory == Path.home()/'.claude' else directory/'.claude.json'
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    cached = _plan_cache.get(str(path))
+    if cached and cached[0] == (stat.st_size, stat.st_mtime_ns):
+        return cached[1]
+    data = load_json(path, {})
+    account = data.get('oauthAccount') if isinstance(data, dict) else None
+    value = None
+    if isinstance(account, dict) and isinstance(account.get('emailAddress'), str):
+        fetched = account.get('profileFetchedAt')
+        value = {'email': account['emailAddress'], 'type': token(account.get('organizationType')),
+                 'billing': token(account.get('billingType')), 'status': None, 'period': None,
+                 'started_at': timestamp(account.get('subscriptionCreatedAt')),
+                 'checked_at': fetched/1000 if finite(fetched) else None, 'source': 'client_profile'}
+    if len(_plan_cache) > 64:
+        _plan_cache.clear()
+    _plan_cache[str(path)] = ((stat.st_size, stat.st_mtime_ns), value)
+    return value
+
+
+def add_months(start, months):
+    month = start.month - 1 + months
+    year, month = start.year + month // 12, month % 12 + 1
+    return start.replace(year=year, month=month, day=min(start.day, calendar.monthrange(year, month)[1]))
+
+
+def plan_view(plan, now):
+    """The official profile reports when a subscription started, never when it ends. A plan
+    still paid after an anniversary has renewed, so the current period ends at the next one:
+    a month or a year apart, monthly when the usage response does not say."""
+    if not isinstance(plan, dict):
+        return None
+    view = {key: plan.get(key) for key in
+            ('type', 'billing', 'status', 'period', 'started_at', 'checked_at', 'source')}
+    view.update(ends_at=None, renewals=None)
+    start = plan.get('started_at')
+    if (view['type'] in PAID_PLANS and view['billing'] in RENEWING_BILLING
+            and finite(start) and 0 < start <= now + 86400):
+        begin, current = datetime.fromtimestamp(start, UTC), datetime.fromtimestamp(now, UTC)
+        step = PLAN_MONTHS.get(view['period'], 1)
+        cycles = max(1, ((current.year - begin.year)*12 + current.month - begin.month) // step)
+        while add_months(begin, cycles*step).timestamp() <= now:
+            cycles += 1
+        view.update(ends_at=add_months(begin, cycles*step).timestamp(), renewals=cycles-1)
+    return view
+
+
+def official_usage(registry, name, client_factory=OfficialClient):
+    """One authenticated read of the official usage API; no model request. It also reports a
+    session window that has not started yet. An expired login is left to the official client,
+    which refreshes it on its next start."""
+    expires = token_expiry(registry, name)
+    if expires is not None and expires <= time.time()+60:
+        raise CardError('token_expired', '登录凭据已过期，等官方客户端刷新', 401)
+    identity, payload = client_factory(registry, name).read()
+    return identity['email'], oauth_windows(payload, time.time())
 
 
 def parse_reset(text, now, window):
@@ -189,6 +404,30 @@ def probe_usage(binary, env, cwd, stop_event=None, timeout=18):
         os.close(master)
 
 
+def probe_complete(binary, env, cwd, stop_event=None, known=None):
+    """/usage, read once more when only the weekly window shows. A new session window appears
+    only after the account's first request in it, so a window known to have reset (or known to
+    be unstarted) that is still missing after the retry is taken as unused. Without such a
+    reading nothing is guessed."""
+    windows = probe_usage(binary, env, cwd, stop_event)
+    if 'seven_day' not in windows or 'five_hour' in windows:
+        return windows
+    if stop_event.wait(PROBE_RETRY_SECONDS) if stop_event else time.sleep(PROBE_RETRY_SECONDS):
+        raise ProbeError('服务正在停止')
+    with contextlib.suppress(ProbeError):
+        windows = {**windows, **probe_usage(binary, env, cwd, stop_event)}
+    if 'five_hour' in windows:
+        return windows
+    last = (known or {}).get('five_hour') or {}
+    used, reset = last.get('used_percentage'), last.get('resets_at')
+    if not finite(used) or not ((finite(reset) and reset <= time.time()) or (reset is None and used == 0)):
+        return windows
+    windows['five_hour'] = {'used_percentage': 0.0, 'resets_at': None, 'reset_precision': 'minute',
+                            'observed_at': windows['seven_day']['observed_at'],
+                            'source': 'official_cli_usage', 'inferred': 'session_not_started'}
+    return windows
+
+
 def load_account_module(path):
     loader = importlib.machinery.SourceFileLoader('claude_accounts_monitor_adapter', str(path))
     spec = importlib.util.spec_from_loader(loader.name, loader)
@@ -221,6 +460,10 @@ class Monitor:
         self.registry = {}
         self.load_registry()
         self.reset_cards = ResetCards(self)
+        # Light official usage reads between /usage queries; memory only, restarted staggered.
+        self.official = {}
+        self.official_error = None
+        self.official_worker = None
 
     def load_registry(self):
         data = load_json(self.root/'accounts.json', {})
@@ -238,6 +481,86 @@ class Monitor:
     def start(self):
         self.worker = threading.Thread(target=self.loop, name='official-usage-collector', daemon=True)
         self.worker.start()
+        self.official_worker = threading.Thread(target=self.official_loop, name='official-usage-api', daemon=True)
+        self.official_worker.start()
+
+    def busy_accounts(self, now):
+        busy = set(self.active_accounts())
+        busy.update(j['account'] for j in delegation_jobs(self.root, now) if j['alive'] and j['account'])
+        return busy
+
+    def official_next(self, registry, busy, now):
+        """The account whose usage read is due first: each minute while a session or delegated
+        job uses it, every few minutes otherwise, and right after one of its windows resets."""
+        best = (None, None)
+        for index, name in enumerate(registry['profiles']):
+            if name in registry.get('disabled', {}):
+                continue
+            with self.lock:
+                record = self.records.get(name, {})
+                state = self.official.setdefault(name, {'next_at': now+2*index})
+            if record.get('loggedIn') is not True:
+                continue
+            due, last = state['next_at'], state.get('attempted_at', 0)
+            if not state.get('failures'):
+                if name in busy:
+                    due = min(due, last+OFFICIAL_BUSY_SECONDS)
+                for window in (record.get('windows') or {}).values():
+                    reset = window.get('resets_at') if isinstance(window, dict) else None
+                    if finite(reset) and last < reset+5 <= now:
+                        due = min(due, reset+5)
+            if best[0] is None or due < best[1]:
+                best = (name, due)
+        return best
+
+    def ask_client(self, name, state, now):
+        # The official client refreshes its own login when it starts; one /usage query does it.
+        if now-state.get('cli_requested_at', 0) > 1800:
+            state['cli_requested_at'] = now
+            with self.lock:
+                self.requested.add(name)
+            self.wake.set()
+
+    def poll_official(self, registry, name, busy):
+        now = time.time()
+        with self.lock:
+            state = self.official.setdefault(name, {})
+        state['attempted_at'] = now
+        try:
+            expires = token_expiry(registry, name)
+            if expires is not None and expires <= now+60:
+                self.ask_client(name, state, now)
+                state.update(error='登录凭据待刷新，已请官方客户端查询一次', next_at=now+300)
+                return
+            self.reset_cards.query(name)
+            done = time.time()
+            state.update(error=None, failures=0, ok_at=done,
+                         next_at=done+(OFFICIAL_BUSY_SECONDS if busy else OFFICIAL_IDLE_SECONDS))
+        except CardError as exc:
+            if exc.code == 'busy':
+                state.update(next_at=now+30)
+                return
+            if exc.code == 'http_401':
+                self.ask_client(name, state, now)
+            failures = state.get('failures', 0)+1
+            state.update(error=str(exc), failures=failures, next_at=now+min(OFFICIAL_MAX_BACKOFF, 60*2**failures))
+
+    def official_loop(self):
+        while not self.stop.is_set():
+            try:
+                registry = self.load_registry()
+                now = time.time()
+                busy = self.busy_accounts(now)
+                name, due = self.official_next(registry, busy, now)
+                if name and due <= now:
+                    self.poll_official(registry, name, name in busy)
+                    self.official_error = None
+                    continue
+                self.stop.wait(min(15, max(1, due-now)) if name else 15)
+            except Exception as exc:
+                # No credentials, responses or environment values in web responses/logs.
+                self.official_error = '自动查询暂停：'+type(exc).__name__
+                self.stop.wait(30)
 
     def refresh(self, profile=None):
         self.load_registry()
@@ -309,8 +632,8 @@ class Monitor:
                 record.update(error='此位置尚未登录 Claude 订阅账号', windows={}, checked_at=None)
             else:
                 self.adapter.inherit_preferences(registry, name)
-                windows = probe_usage(registry['claude'], self.adapter.profile_env(registry, name),
-                                      self.cwd, self.stop)
+                windows = probe_complete(registry['claude'], self.adapter.profile_env(registry, name),
+                                         self.cwd, self.stop, known=record.get('windows'))
                 # A partial terminal render must not erase the other window.
                 merged = dict(record.get('windows', {}))
                 merged.update(windows)
@@ -346,19 +669,9 @@ class Monitor:
         sync = getattr(self.adapter, 'record_quota_recovery', None)
         return bool(sync and sync(self.root/'state', name, windows, at, started_at))
 
-    def record_official_usage(self, name, identity, payload, at, request_started_at=None):
-        """The reset query also returns a fresh quota snapshot for the same identity."""
-        windows = {}
-        for key in ('five_hour', 'seven_day', 'seven_day_opus', 'seven_day_sonnet'):
-            raw = payload.get(key)
-            if not isinstance(raw, dict):
-                continue
-            used, reset = raw.get('utilization'), timestamp(raw.get('resets_at'))
-            if not finite(used) or not 0 <= used <= 100:
-                continue
-            windows[key] = {'used_percentage': used, 'resets_at': reset,
-                            'reset_precision': 'second', 'observed_at': at,
-                            'source': 'official_oauth_api'}
+    def record_official_usage(self, name, identity, payload, at, request_started_at=None, plan=None):
+        """The reset query also returns a fresh quota snapshot and plan for the same identity."""
+        windows = oauth_windows(payload, at)
         with self.lock:
             record = copy.deepcopy(self.records.get(name, {}))
             if (record.get('email') != identity['email'] or
@@ -368,6 +681,10 @@ class Monitor:
                           official_identity=identity, auth_checked_at=at, checked_at=at,
                           usage_query_started_at=request_started_at if request_started_at is not None else at)
             record.setdefault('windows', {}).update(windows)
+            if isinstance(plan, dict):
+                previous = record.get('plan') or {}
+                record['plan'] = {**plan, 'period': billing_period(payload) or previous.get('period'),
+                                  'checked_at': at, 'source': 'official_oauth_api'}
             missing = [k for k in ('five_hour', 'seven_day') if k not in windows]
             record.update(missing_windows=missing, error='官方查询未返回完整额度，保留最近记录' if missing else None)
             record['launcher_synced'] = self.sync_launcher_usage(name, windows, at, record['usage_query_started_at'])
@@ -427,10 +744,12 @@ class Monitor:
         now = time.time()
         live = self.observations()
         active = self.active_accounts()
+        jobs = delegation_jobs(self.root, now)
         quotas = self.adapter.read_quota_state(self.root/'state')
         with self.lock:
             records, cards = copy.deepcopy(self.records), copy.deepcopy(self.cards)
             names = list(self.registry['profiles'])
+            profiles = dict(self.registry['profiles'])
             disabled = copy.deepcopy(self.registry.get('disabled', {}))
             busy, error = self.busy, self.error
         accounts = []
@@ -443,10 +762,26 @@ class Monitor:
                                rec.get('identity_changed_at', 0))
                 if rec.get('loggedIn') and observation['observed_at'] > boundary:
                     windows[key] = observation
+            # A delegated print session reports the same official reading with every response.
+            for job in jobs:
+                limits = job.get('limits')
+                if job['account'] != name or not limits:
+                    continue
+                for key, reading in limits['windows'].items():
+                    boundary = max(windows.get(key, {}).get('observed_at', 0),
+                                   rec.get('identity_changed_at', 0))
+                    if rec.get('loggedIn') and limits['at'] > boundary:
+                        windows[key] = {**reading, 'observed_at': limits['at'],
+                                        'source': 'delegated_session', 'reset_precision': 'second'}
             last_observed = max([w.get('observed_at', 0) for w in windows.values()] or [0])
             rec['last_observed_at'] = last_observed or None
             rec['live'] = active.get(name, 0) > 0
             rec['active_sessions'] = active.get(name, 0)
+            # Delegated `claude -p` jobs run without --settings, so active_accounts() cannot see them.
+            rec['delegated'] = sum(j['account'] == name and j['alive'] for j in jobs)
+            with self.lock:
+                auto = dict(self.official.get(name, {}))
+            rec['auto'] = {key: auto.get(key) for key in ('ok_at', 'next_at', 'error')}
             for window in windows.values():
                 reset = window.get('resets_at')
                 window['expired'] = bool(finite(reset) and reset <= now)
@@ -477,6 +812,13 @@ class Monitor:
             if quota_active:
                 resets.append(until)
             rec['available_after'] = max(resets) if resets else None
+            plan = rec.get('plan')
+            if not isinstance(plan, dict):
+                # Disabled accounts are never queried; the client's last profile read still has the plan.
+                local = client_plan(profiles[name])
+                if local and (not rec.get('email') or local['email'] == rec['email']):
+                    plan = local
+            rec['plan'] = plan_view(plan, now)
             if name in disabled:
                 state = 'disabled'
                 entry = disabled[name]
@@ -503,7 +845,11 @@ class Monitor:
         return {'version': VERSION, 'server_time': now, 'started_at': self.started_at,
                 'mode': 'initial_snapshot_then_statusline', 'browser_interval': 5, 'busy': busy,
                 'initial_sync_complete': all(name in self.initialized or name in disabled for name in names) and not busy,
-                'collector_error': error, 'availability': availability, 'accounts': accounts}
+                'collector_error': error, 'availability': availability, 'accounts': accounts,
+                'delegations': jobs, 'delegation_policy': delegation_policy(self.root, now),
+                'auto_refresh': {'busy_seconds': OFFICIAL_BUSY_SECONDS, 'idle_seconds': OFFICIAL_IDLE_SECONDS,
+                                 'running': bool(self.official_worker and self.official_worker.is_alive()),
+                                 'error': self.official_error}}
 
     def set_card(self, payload):
         name = payload.get('profile')
